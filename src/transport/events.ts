@@ -107,8 +107,8 @@ export function parseEvent(raw: RawSessionEvent): OutboundEvent | undefined {
     }
 
     case 'tool/result': {
-      const data = raw.data as { message?: { source?: { callId?: string } }; error?: { name: string; code: string } };
-      const callId = data.message?.source?.callId;
+      const data = raw.data as { message?: { toolCallId?: string; source?: { callId?: string } }; error?: { name: string; code: string } };
+      const callId = data.message?.toolCallId ?? data.message?.source?.callId;
       if (!callId) return undefined;
       return { type: 'tool/result', callId, error: data.error, raw: raw.data };
     }

@@ -157,14 +157,17 @@ async function assertSafeHostname(hostname: string): Promise<void> {
 }
 
 /** 安全下载：仅 HTTPS + SSRF 防护 + 大小上限 + 超时，返回字节 Buffer（不落盘） */
-async function download(url: string, maxBytes: number): Promise<Buffer> {
+async function download(url: string, maxBytes: number, signal?: AbortSignal): Promise<Buffer> {
+  signal?.throwIfAborted();
   const parsed = new URL(normalizeUrl(url));
   if (parsed.protocol !== 'https:') {
     throw new Error(`Only HTTPS allowed: ${parsed.protocol}`);
   }
   await assertSafeHostname(parsed.hostname);
 
-  const resp = await fetch(url, { signal: AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS) });
+  signal?.throwIfAborted();
+  const timeout = AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS);
+  const resp = await fetch(url, { signal: signal ? AbortSignal.any([signal, timeout]) : timeout });
   if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
 
   const buf = Buffer.from(await resp.arrayBuffer());
@@ -184,6 +187,7 @@ export async function downloadMediaAttachments(
   attachments: RawAttachment[] | undefined,
   media: MediaConfig,
   logger: Logger,
+  signal?: AbortSignal,
 ): Promise<DownloadedFile[]> {
   if (!media.enabled) return [];
 
@@ -198,6 +202,7 @@ export async function downloadMediaAttachments(
 
   const results: DownloadedFile[] = [];
   for (const att of targets) {
+    signal?.throwIfAborted();
     const contentType = classifyContentType(att.content_type) as 'image' | 'video' | 'file';
     const destPath = toPosixPath(join(MEDIA_ROOT, uniqueFilename(att.filename)));
 
@@ -208,12 +213,13 @@ export async function downloadMediaAttachments(
 
     let buf: Buffer;
     try {
-      buf = await download(att.url, maxBytes);
+      buf = await download(att.url, maxBytes, signal);
     } catch (err) {
       logger.warn(`im-qqbot: download failed: ${att.filename} — ${err instanceof Error ? err.message : String(err)}`);
       continue; // 下载失败不加入结果，由 buildDynamicCtx 回退为描述
     }
 
+    signal?.throwIfAborted();
     // 图片按真实格式校正扩展名（QQ 的 content_type 不可信），落盘到最终路径
     const localPath = contentType === 'image' ? toPosixPath(correctImageExt(destPath, buf)) : destPath;
     writeFileSync(localPath, buf);

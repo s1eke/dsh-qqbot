@@ -12,6 +12,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { QrConnectCallbacks, QrConnectOptions } from '@tencent-connect/qqbot-connector';
+import { parseDocument } from 'yaml';
+import { ConfigSchema } from '../config.ts';
 import { registerBindRoutes, type WebRoute } from './bind-routes.ts';
 import { BindingService } from './binding-service.ts';
 import { persistCredentialsToProfile } from './persist.ts';
@@ -70,7 +72,7 @@ function fakeRes(): ServerResponse & { statusCode: number; body: string } {
 }
 
 /** 直接注册路由（不走 createHarness 的 manual 包装，让默认 persist 处理器生效） */
-function registerRealRoutes(boundAppId: () => string | null): Map<string, WebRoute> {
+function registerRealRoutes(boundAppId: () => string | null, currentConfig?: () => Record<string, unknown>): Map<string, WebRoute> {
   const routes = new Map<string, WebRoute>();
   const service = { wireState: () => ({ phase: 'starting' }), refresh: vi.fn() };
   registerBindRoutes(
@@ -82,7 +84,7 @@ function registerRealRoutes(boundAppId: () => string | null): Map<string, WebRou
     },
     service as never,
     { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
-    { boundAppId },
+    { boundAppId, currentConfig },
   );
   return routes;
 }
@@ -111,6 +113,66 @@ afterEach(() => {
 });
 
 describe('绑定链路 × 真实 persist 落盘（#53 回归）', () => {
+  it('模式开关往返保存并在重载后回显，保留自定义高级配置、其他字段与注释', async () => {
+    dir = mkdtempSync(join(tmpdir(), 'im-qqbot-bind-mode-'));
+    patchPath = join(dir, 'cordis.patch.yml');
+    const original = SHARED_PATCH.replace('    requireMention: true', [
+      '    requireMention: true # 其他开关',
+      '    conversation: # 自定义会话配置',
+      '      mode: serial # 仅编辑此项',
+      '      admissionTimeoutMs: 41000 # 接入期限',
+      '      maxPendingInputs: 9',
+      '      maxPendingBytes: 9999',
+      '      mainTimeoutMs: 120000',
+      '      taskTimeoutMs: 900000',
+      '      taskAdmins: [owner-one, owner-two] # 管理员',
+      '      futureSetting: keep-me # 尚未开放的参数',
+    ].join('\n'));
+    writeFileSync(patchPath, original, 'utf8');
+    profileDirState.dir = dir;
+    const readSaved = () => (parseDocument(readFileSync(patchPath, 'utf8')).toJS() as Array<{ id?: string; config?: Record<string, unknown> }>)
+      .find(row => row.id === 'im-qqbot')!.config!;
+    const advanced = { ...(readSaved().conversation as Record<string, unknown>) };
+    const reloadedRoutes = () => {
+      // Simulate the loader's next fiber applying the persisted patch, as GET reports live config.
+      const current = ConfigSchema(readSaved());
+      return registerRealRoutes(() => null, () => current as unknown as Record<string, unknown>);
+    };
+    let routes = reloadedRoutes();
+    for (const mode of ['interactive', 'serial']) {
+      const saved = fakeRes();
+      await invoke(routes.get(BIND_CONFIG_PATH), fakeReq('POST', JSON.stringify({ conversation: { mode } })), saved);
+      expect(saved.statusCode).toBe(200);
+      expect(readSaved().conversation).toEqual({ ...advanced, mode });
+      const after = readFileSync(patchPath, 'utf8');
+      for (const comment of ['其他开关', '自定义会话配置', '仅编辑此项', '接入期限', '管理员', '尚未开放的参数']) {
+        expect(after).toContain(`# ${comment}`);
+      }
+      expectSharedPreserved(patchPath);
+      routes = reloadedRoutes();
+      const loaded = fakeRes();
+      await invoke(routes.get(BIND_CONFIG_PATH), fakeReq('GET'), loaded);
+      expect(loaded.statusCode).toBe(200);
+      expect(JSON.parse(loaded.body).config.conversation).toMatchObject({ mode, admissionTimeoutMs: 41000,
+        maxPendingInputs: 9, maxPendingBytes: 9999, mainTimeoutMs: 120000, taskTimeoutMs: 900000,
+        taskAdmins: ['owner-one', 'owner-two'] });
+    }
+  });
+
+  it('模式开关遇到共享 conversation 时返回保存失败并保留原文件', async () => {
+    dir = mkdtempSync(join(tmpdir(), 'im-qqbot-bind-mode-shared-'));
+    patchPath = join(dir, 'cordis.patch.yml');
+    const original = '- id: im-qqbot\n  config:\n    conversation: &shared { mode: serial, taskAdmins: [owner] }\n- id: other\n  config: *shared\n';
+    writeFileSync(patchPath, original, 'utf8');
+    profileDirState.dir = dir;
+    const routes = registerRealRoutes(() => null);
+    const res = fakeRes();
+    await invoke(routes.get(BIND_CONFIG_PATH), fakeReq('POST', '{"conversation":{"mode":"interactive"}}'), res);
+    expect(res.statusCode).toBe(500);
+    expect(JSON.parse(res.body)).toMatchObject({ ok: false });
+    expect(readFileSync(patchPath, 'utf8')).toBe(original);
+  });
+
   it('手动绑定 → 配置保存 → 解绑：三操作全链路保留其他插件配置', async () => {
     dir = mkdtempSync(join(tmpdir(), 'im-qqbot-bind-it-'));
     patchPath = join(dir, 'cordis.patch.yml');
@@ -208,6 +270,9 @@ describe('绑定链路 × 真实 persist 落盘（#53 回归）', () => {
     ['只读 cwd 字段', '{"cwd":"/tmp"}'],
     ['未知字段', '{"timeoutMs":100}'],
     ['类型错误（requireMention 传字符串）', '{"requireMention":"yes"}'],
+    ['conversation 未开放的高级字段', '{"conversation":{"mode":"interactive","taskAdmins":["attacker"]}}'],
+    ['conversation 未知模式', '{"conversation":{"mode":"automatic"}}'],
+    ['conversation 非对象', '{"conversation":"interactive"}'],
   ])('配置保存拒绝：%s → 400 且文件不变', async (_name, body) => {
     dir = mkdtempSync(join(tmpdir(), 'im-qqbot-bind-rej-'));
     patchPath = join(dir, 'cordis.patch.yml');

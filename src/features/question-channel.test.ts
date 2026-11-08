@@ -1,429 +1,261 @@
-import { describe, it, expect, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { InteractionEvent } from '@tencent-connect/qqbot-nodejs';
-import {
-  QuestionChannel,
-  type UserQuestion,
-  type UserQuestionRequest,
-  type UserQuestionResult,
-  type QuestionSessionRecordLike,
-} from './question-channel.ts';
+import { QuestionChannel, type UserQuestionRequest, type UserQuestionResult, type QuestionChannelContext } from './question-channel.ts';
 import { buildKeyboard, formatQuestion } from './question-renderer.ts';
 import { parseAnswer } from './answer-parser.ts';
-import type { ChatScope, Logger, ReplyTarget } from '../types.ts';
+import { decodeButtonData } from './button-utils.ts';
+import type { TaskRecord } from './task-registry.ts';
 
-function createLogger(): Logger {
-  return { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() };
-}
-
-interface SentMessage {
-  text: string;
-  opts?: { keyboard?: unknown };
-}
-
-function createSender(sent: SentMessage[], opts?: { failKeyboard?: boolean }) {
-  return {
-    sendMarkdown: vi.fn(async (_target: ReplyTarget, content: string, o?: { keyboard?: unknown }) => {
-      if (o?.keyboard && opts?.failKeyboard) throw new Error('keyboard not permitted');
-      sent.push({ text: content, opts: o });
-    }),
+const question = (id = 'q') => ({ id, question: '选哪个？', options: [{ label: 'A' }, { label: 'B' }] });
+const logger = () => ({ debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() });
+function setup(group = false, interactive = false) {
+  const scope = group ? 'group' as const : 'c2c' as const;
+  const peer = group ? 'group1' : 'user1';
+  const agent = { id: 'root', session: {} };
+  const record = { sessionKey: 'key', scope, senderId: 'user1', generation: 1, agent,
+    replyTarget: { scope, targetId: peer, msgId: 'm1' } };
+  const manager = {
+    findBySessionId: vi.fn((id: string) => id === 'root' ? record : undefined),
+    getSessionRecord: vi.fn((s: string, p: string) => s === scope && p === peer ? record : undefined),
+    holdActivity: vi.fn(() => vi.fn()),
+    taskRegistry: { actorFor: vi.fn((): string | undefined => 'trusted-owner'), noteQuestionAnswer: vi.fn(() => vi.fn()),
+      noteQuestionOpenAnswer: vi.fn(() => vi.fn()),
+      get: vi.fn((_id: string, _scope: string, _peer: string): TaskRecord | undefined => undefined) },
   };
-}
-
-const sessionKey = (scope: ChatScope, peerId: string): string => `qqbot:app:${scope}:${peerId}`;
-
-function makeRecord(sessionKeyStr: string, scope: ChatScope = 'c2c'): QuestionSessionRecordLike {
-  return { sessionKey: sessionKeyStr, scope, replyTarget: { scope, targetId: 'x', msgId: 'm' } };
-}
-
-function createManager(opts?: {
-  findBySessionId?: (id: string) => QuestionSessionRecordLike | undefined;
-  getSessionRecord?: (scope: ChatScope, peerId: string) => QuestionSessionRecordLike | undefined;
-}) {
-  return {
-    findBySessionId: opts?.findBySessionId ?? (() => undefined),
-    // 默认按 scope+peerId 派生 sessionKey 反查，与 startAsk 的 key 生成保持一致
-    getSessionRecord: opts?.getSessionRecord ?? ((scope: ChatScope, peerId: string) => makeRecord(sessionKey(scope, peerId), scope)),
+  const sender = { sendMarkdown: vi.fn(async (..._args: unknown[]) => ({ id: 'card1' })) };
+  const callbacks = new Map<string, (...args: unknown[]) => unknown>();
+  let active: Array<{ callId: string; state: 'open' | 'continued'; questions: ReturnType<typeof question>[] }> = [];
+  const service = { ask: vi.fn(), answer: vi.fn(() => true) };
+  const projection = { snapshot: vi.fn(() => ({ values: { userQuestions: { active } } })) };
+  const dispose = vi.fn();
+  const ctx: QuestionChannelContext = {
+    get: name => name === 'userQuestions' ? service : name === 'sessionProjections' ? projection : undefined,
+    on: vi.fn((event, callback) => { callbacks.set(event, callback); return dispose; }),
   };
+  const channel = new QuestionChannel(manager, sender, {
+    requireMention: true, askTimeoutMs: 1000, conversation: { mode: interactive ? 'interactive' : 'serial', taskAdmins: ['admin'] },
+  }, logger());
+  channel.install(ctx);
+  const ask = (overrides: Partial<UserQuestionRequest> = {}) => callbacks.get('user-questions/request')!(
+    { agent, questions: [question()], ...overrides }, vi.fn()) as Promise<UserQuestionResult>;
+  const cardData = (index = sender.sendMarkdown.mock.calls.length - 1) => {
+    const opts = sender.sendMarkdown.mock.calls[index]![2] as { keyboard: ReturnType<typeof buildKeyboard> };
+    return opts.keyboard!.content.rows[0]!.buttons[0]!.action.data;
+  };
+  const event = (data: string, actor = 'user1'): InteractionEvent => ({
+    ...(group ? { group_openid: peer, group_member_openid: actor } : { user_openid: actor }),
+    data: { resolved: { button_data: data } },
+  }) as InteractionEvent;
+  return { channel, manager, sender, record, agent, service, callbacks, ctx, dispose, ask, cardData, event,
+    project: (value: typeof active) => { active = value; }, scope, peer };
 }
 
-function startAsk(
-  ch: QuestionChannel,
-  scope: ChatScope,
-  peerId: string,
-  questions: UserQuestion[],
-  signal?: AbortSignal,
-): Promise<UserQuestionResult> {
-  const key = sessionKey(scope, peerId);
-  const request: UserQuestionRequest = { questions, ...(signal ? { signal } : {}) };
-  const record = makeRecord(key, scope);
-  return ch.askViaQQ(record, record.replyTarget, request);
-}
+beforeEach(() => vi.useFakeTimers());
+afterEach(() => vi.useRealTimers());
 
-const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
-
-const q2 = (id = 'q'): UserQuestion => ({ id, question: '选哪个？', options: [{ label: 'A' }, { label: 'B' }] });
-
-describe('formatQuestion', () => {
-  it('renders numbered options with description and text hint', () => {
-    const q: UserQuestion = {
-      id: 'q',
-      question: '选哪个？',
-      options: [{ label: 'A', description: '描述A' }, { label: 'B' }],
-    };
-    const text = formatQuestion(q, false, false);
-    expect(text).toContain('1. A · 描述A');
-    expect(text).toContain('2. B');
-    expect(text).toContain('> 💡 回复编号选择');
-    expect(text).toContain('直接输入你的想法');
+describe('QQ native question answerer', () => {
+  it('registers a global waterfall without replacing host validation and delegates non-QQ questions', async () => {
+    const s = setup();
+    const original = s.service.ask;
+    const next = vi.fn(async () => ({ answers: [] }));
+    await s.callbacks.get('user-questions/request')!({ agent: { id: 'web' }, questions: [question()] }, next);
+    expect(next).toHaveBeenCalledOnce();
+    expect(s.service.ask).toBe(original);
+    expect(s.ctx.on).toHaveBeenCalledWith('user-questions/request', expect.any(Function), { global: true, prepend: true });
+    s.channel.uninstall();
+    expect(s.dispose).toHaveBeenCalledTimes(2);
   });
 
-  it('uses button hint with emoji when withButtons', () => {
-    expect(formatQuestion(q2(), false, true)).toContain('> 👇 点击下方按钮选择');
+  it('ordinary text keeps chatting; a matching card or explicit request collects the complete batch', async () => {
+    const s = setup();
+    const result = s.ask({ questions: [question('first'), question('second')], wait: { callId: 'call1', timed: true } });
+    expect(s.channel.tryAnswer(s.scope, s.peer, '进度怎样', 'user1')).toBe(false);
+    expect(s.channel.handleInteraction(s.event(s.cardData()))).toBe(true);
+    expect(s.channel.answerText(s.scope, s.peer, 'user1', 'call1', '2').ok).toBe(true);
+    expect(await result).toEqual({ answers: [{ id: 'first', selected: ['A'] }, { id: 'second', selected: ['B'] }] });
+    expect(s.channel.hasPending('key')).toBe(false);
   });
 
-  it('prefixes multi-select marker and multi-pick hint', () => {
-    const q: UserQuestion = { id: 'q', question: '选哪些？', options: [{ label: 'A' }, { label: 'B' }], multiSelect: true };
-    const text = formatQuestion(q, false, false);
-    expect(text).toContain('选哪些？（可多选）');
-    expect(text).toContain('> 💡 回复多个编号即可多选（如 1,3）');
+  it('two calls sharing a question id keep distinct cards, and stale or foreign buttons cannot answer', async () => {
+    const s = setup();
+    const one = s.ask({ wait: { callId: 'call1', timed: true } });
+    const old = s.cardData();
+    const two = s.ask({ wait: { callId: 'call2', timed: true } });
+    expect(s.channel.handleInteraction(s.event(old, 'other'))).toBe(false);
+    expect(s.channel.handleInteraction(s.event(JSON.stringify({ t: 'question', q: 'q', i: 0 })))).toBe(false);
+    expect(s.channel.handleInteraction(s.event(old))).toBe(true);
+    await one;
+    expect(s.channel.handleInteraction(s.event(old))).toBe(false);
+    expect(s.channel.handleInteraction(s.event(s.cardData()))).toBe(true);
+    await two;
   });
 
-  it('adds @mention note for groups', () => {
-    expect(formatQuestion(q2(), true, false)).toContain('需 @机器人');
-  });
-});
-
-describe('buildKeyboard', () => {
-  it('lays out two options in a single row of two buttons', () => {
-    const kb = buildKeyboard(q2());
-    expect(kb?.content.rows).toHaveLength(1);
-    expect(kb?.content.rows[0]?.buttons).toHaveLength(2);
-    const btn = kb?.content.rows[0]?.buttons[0];
-    expect(btn?.action.type).toBe(1);
-    expect(btn?.action.permission.type).toBe(2);
-    // 单选互斥：同一题选项共享 group_id，点一个后其余变灰（action.type=1 才生效）
-    expect(btn?.group_id).toBe('q-q');
-    // 保留 click_limit=1（每人限点一次，与 openclaw 对齐）
-    expect(btn?.action.click_limit).toBe(1);
-    expect(btn?.render_data.label).toBe('A');
-    expect(btn?.render_data.visited_label).toBe('✓ 已选');
-    // button_data 同时编码 question.id 与选项下标，供 handleInteraction 校验归属题
-    expect(btn?.id).toBe('q-q-opt-0');
-    expect(JSON.parse(btn!.action.data)).toEqual({ t: 'question', q: 'q', i: 0 });
+  it('pins group actor and generation; another sender or a reset cannot consume a card', async () => {
+    const s = setup(true);
+    const result = s.ask();
+    const rejection = result.catch(error => error);
+    s.record.senderId = 'other';
+    expect(s.channel.handleInteraction(s.event(s.cardData(), 'other'))).toBe(false);
+    expect(s.channel.handleInteraction(s.event(s.cardData(), 'user1'))).toBe(true);
+    await result;
+    const another = s.ask();
+    const aborted = another.catch(error => error);
+    s.record.generation++;
+    expect(s.channel.handleInteraction(s.event(s.cardData(), 'admin'))).toBe(false);
+    s.channel.cancelPending('key');
+    expect((await aborted).code).toBe('ASK_ABORTED');
+    await rejection;
   });
 
-  it('wraps options across multiple rows', () => {
-    const opts = [{ label: 'A' }, { label: 'B' }, { label: 'C' }, { label: 'D' }, { label: 'E' }];
-    const kb = buildKeyboard({ id: 'q', question: 't', options: opts });
-    expect(kb?.content.rows).toHaveLength(3); // 2+2+1
-    expect(kb?.content.rows[0]?.buttons).toHaveLength(2);
-    expect(kb?.content.rows[2]?.buttons).toHaveLength(1);
-    expect(JSON.parse(kb!.content.rows[2]!.buttons[0]!.action.data)).toEqual({ t: 'question', q: 'q', i: 4 });
+  it('interactive group ownership comes from the claimed actor, and ambiguous input requires an admin', async () => {
+    const s = setup(true, true);
+    const first = s.ask();
+    expect(s.channel.handleInteraction(s.event(s.cardData(), 'user1'))).toBe(false);
+    expect(s.channel.handleInteraction(s.event(s.cardData(), 'trusted-owner'))).toBe(true);
+    await first;
+    s.manager.taskRegistry.actorFor.mockReturnValue(undefined);
+    const second = s.ask();
+    expect(s.channel.handleInteraction(s.event(s.cardData(), 'trusted-owner'))).toBe(false);
+    expect(s.channel.handleInteraction(s.event(s.cardData(), 'admin'))).toBe(true);
+    await second;
   });
 
-  it('returns undefined for multi-select or no-options', () => {
-    expect(buildKeyboard({ ...q2(), multiSelect: true })).toBeUndefined();
-    expect(buildKeyboard({ id: 'q', question: 't' })).toBeUndefined();
-  });
-});
-
-describe('parseAnswer', () => {
-  it('maps numbers to option labels', () => {
-    expect(parseAnswer(q2(), '2')).toEqual({ id: 'q', selected: ['B'] });
-  });
-
-  it('supports multi-select numbers', () => {
-    const q: UserQuestion = { id: 'q', question: 't', options: [{ label: 'A' }, { label: 'B' }, { label: 'C' }], multiSelect: true };
-    expect(parseAnswer(q, '1,3')).toEqual({ id: 'q', selected: ['A', 'C'] });
-  });
-
-  it('falls back to custom for free text and out-of-range', () => {
-    expect(parseAnswer(q2(), '9')).toEqual({ id: 'q', selected: [], custom: '9' });
-    expect(parseAnswer(q2(), '自定义')).toEqual({ id: 'q', selected: [], custom: '自定义' });
-  });
-
-  it('no options → custom', () => {
-    expect(parseAnswer({ id: 'q', question: 't' }, '小明')).toEqual({ id: 'q', selected: [], custom: '小明' });
-  });
-});
-
-describe('QuestionChannel.tryAnswer', () => {
-  it('resolves single-question and consumes the message', async () => {
-    const sent: SentMessage[] = [];
-    const ch = new QuestionChannel(createManager(), createSender(sent), { requireMention: false, askTimeoutMs: 60_000 }, createLogger());
-    const p = startAsk(ch, 'c2c', 'U1', [q2()]);
-    await sleep(20);
-    expect(ch.tryAnswer('c2c', 'U1', '2')).toBe(true);
-    expect(await p).toEqual({ answers: [{ id: 'q', selected: ['B'] }] });
+  it('native foreground timeout rejects promptly, preserves the question, and queues a late batch once', async () => {
+    const s = setup();
+    const controller = new AbortController();
+    const result = s.ask({ signal: controller.signal, wait: { callId: 'call1', timed: true } });
+    const rejected = result.catch(error => error);
+    const data = s.cardData();
+    // The plugin's legacy timeout does not cancel the host's timed question.
+    await vi.advanceTimersByTimeAsync(1500);
+    expect(s.channel.hasPending('key')).toBe(true);
+    controller.abort(Object.assign(new Error('deadline'), { code: 'ASK_TIMED_OUT' }));
+    expect((await rejected).code).toBe('ASK_TIMED_OUT');
+    // Answer arrives between foreground abort and durable pending result.
+    expect(s.channel.handleInteraction(s.event(data))).toBe(true);
+    expect(s.channel.handleInteraction(s.event(data))).toBe(false);
+    expect(s.channel.answerText(s.scope, s.peer, 'user1', 'call1', '2').ok).toBe(false);
+    expect(s.service.answer).not.toHaveBeenCalled();
+    s.project([{ callId: 'call1', state: 'continued', questions: [question()] }]);
+    s.callbacks.get('session/event')!();
+    await vi.runAllTicks();
+    expect(s.manager.taskRegistry.noteQuestionAnswer).toHaveBeenCalledExactlyOnceWith('root', 'call1', 'user1', undefined);
+    expect(s.service.answer).toHaveBeenCalledExactlyOnceWith(s.agent, 'call1', { answers: [{ id: 'q', selected: ['A'] }] });
+    expect(s.channel.handleInteraction(s.event(data))).toBe(false);
   });
 
-  it('advances multi-question one by one', async () => {
-    const sent: SentMessage[] = [];
-    const ch = new QuestionChannel(createManager(), createSender(sent), { requireMention: false, askTimeoutMs: 60_000 }, createLogger());
-    const q1: UserQuestion = { id: 'a', question: '问题1', options: [{ label: 'A1' }, { label: 'B1' }] };
-    const q2b: UserQuestion = { id: 'b', question: '问题2', options: [{ label: 'A2' }, { label: 'B2' }] };
-    const p = startAsk(ch, 'c2c', 'U1', [q1, q2b]);
-    await sleep(20);
-    expect(sent).toHaveLength(1);
-    expect(sent[0]!.text).toContain('问题1');
-
-    expect(ch.tryAnswer('c2c', 'U1', '1')).toBe(true);
-    await sleep(20);
-    expect(sent).toHaveLength(2);
-    expect(sent[1]!.text).toContain('问题2');
-
-    expect(ch.tryAnswer('c2c', 'U1', '2')).toBe(true);
-    expect(await p).toEqual({ answers: [{ id: 'a', selected: ['A1'] }, { id: 'b', selected: ['B2'] }] });
+  it('routes simultaneous relayed task questions to their actual owners even in a mixed-author step', async () => {
+    const s = setup(true, true);
+    s.manager.taskRegistry.actorFor.mockReturnValue(undefined);
+    s.manager.taskRegistry.get.mockImplementation((id, scope, peer) => ({ taskId: id, rootSessionId: 'root', scope,
+      peerId: peer, runId: 'run1', ownerId: id === 'task-one' ? 'alice' : 'bob' }) as TaskRecord);
+    const first = s.ask({ questions: [question('task-one:choice')], wait: { callId: 'call1', timed: true } });
+    const firstData = s.cardData();
+    const second = s.ask({ questions: [question('task-two:choice')], wait: { callId: 'call2', timed: true } });
+    const secondData = s.cardData();
+    expect(s.sender.sendMarkdown.mock.calls[0]![1]).toContain('任务 task-one');
+    expect(s.channel.handleInteraction(s.event(firstData, 'bob'))).toBe(false);
+    expect(s.channel.handleInteraction(s.event(secondData, 'alice'))).toBe(false);
+    expect(s.channel.handleInteraction(s.event(firstData, 'alice'))).toBe(true);
+    expect(s.channel.handleInteraction(s.event(secondData, 'bob'))).toBe(true);
+    await Promise.all([first, second]);
+    expect(s.manager.taskRegistry.noteQuestionOpenAnswer).toHaveBeenCalledWith('root', 'call1', 'alice', ['task-one']);
+    expect(s.manager.taskRegistry.noteQuestionOpenAnswer).toHaveBeenCalledWith('root', 'call2', 'bob', ['task-two']);
+    await expect(s.ask({ questions: [question('task-one:a'), question('task-two:b')] }))
+      .rejects.toMatchObject({ code: 'MIXED_TASK_OWNERS' });
+    await expect(s.ask({ questions: [question('task-one:a'), question('ordinary')] }))
+      .rejects.toMatchObject({ code: 'MIXED_TASK_OWNERS' });
+    const stale = s.ask({ questions: [question('task-one:stale')], wait: { callId: 'stale', timed: true } }).catch(error => error);
+    s.manager.taskRegistry.get.mockReturnValue({ taskId: 'task-one', rootSessionId: 'root', scope: s.scope,
+      peerId: s.peer, ownerId: 'alice', runId: 'run2' } as TaskRecord);
+    expect(s.channel.handleInteraction(s.event(s.cardData(), 'alice'))).toBe(false);
+    s.channel.cancelPending('key');
+    expect((await stale).code).toBe('ASK_ABORTED');
+    s.manager.taskRegistry.get.mockReturnValue({ taskId: 'task-foreign', rootSessionId: 'foreign',
+      scope: 'group', peerId: s.peer, ownerId: 'alice' } as TaskRecord);
+    await expect(s.ask({ questions: [question('task-foreign:q')] })).rejects.toMatchObject({ code: 'BAD_TASK_QUESTION' });
+    expect(s.sender.sendMarkdown).toHaveBeenCalledTimes(3);
   });
 
-  it('ignores empty text and returns false when no pending question', async () => {
-    const sent: SentMessage[] = [];
-    const ch = new QuestionChannel(createManager(), createSender(sent), { requireMention: false, askTimeoutMs: 60_000 }, createLogger());
-    expect(ch.tryAnswer('c2c', 'nobody', '1')).toBe(false);
-
-    const p = startAsk(ch, 'c2c', 'U1', [q2()]);
-    await sleep(20);
-    expect(ch.tryAnswer('c2c', 'U1', '')).toBe(false);
-    ch.tryAnswer('c2c', 'U1', '1');
-    await p;
-  });
-});
-
-describe('QuestionChannel.askViaQQ', () => {
-  it('attaches keyboard for single-select', async () => {
-    const sent: SentMessage[] = [];
-    const ch = new QuestionChannel(createManager(), createSender(sent), { requireMention: true, askTimeoutMs: 60_000 }, createLogger());
-    const p = startAsk(ch, 'c2c', 'U1', [q2()]);
-    await sleep(20);
-    expect(sent[0]?.opts?.keyboard).toBeDefined();
-    expect(sent[0]?.text).toContain('点击下方按钮选择');
-    ch.tryAnswer('c2c', 'U1', '1');
-    await p;
+  it('normal cancellation and unload terminate all calls, including during a pending send', async () => {
+    const s = setup();
+    s.sender.sendMarkdown.mockImplementation(() => new Promise(() => {}));
+    const controller = new AbortController();
+    const first = s.ask({ signal: controller.signal }).catch(error => error);
+    const second = s.ask().catch(error => error);
+    controller.abort();
+    expect((await first).code).toBe('ASK_ABORTED');
+    s.channel.uninstall();
+    expect((await second).code).toBe('ASK_ABORTED');
+    expect(s.channel.hasPending('key')).toBe(false);
   });
 
-  it('falls back to plain text when keyboard send fails', async () => {
-    const sent: SentMessage[] = [];
-    const ch = new QuestionChannel(createManager(), createSender(sent, { failKeyboard: true }), { requireMention: false, askTimeoutMs: 60_000 }, createLogger());
-    const p = startAsk(ch, 'c2c', 'U1', [q2()]);
-    await sleep(20);
-    expect(sent).toHaveLength(1);
-    expect(sent[0]?.opts).toBeUndefined();
-    expect(sent[0]?.text).toContain('回复编号选择');
-    ch.tryAnswer('c2c', 'U1', '1');
-    await p;
+  it('retains a continued question and its owner if card delivery fails after the foreground deadline', async () => {
+    const s = setup(true, true);
+    let failSend!: (error: Error) => void;
+    s.sender.sendMarkdown.mockImplementation(() => new Promise((_resolve, reject) => { failSend = reject; }));
+    const controller = new AbortController();
+    const foreground = s.ask({ signal: controller.signal, wait: { callId: 'late', timed: true } }).catch(error => error);
+    controller.abort(Object.assign(new Error('timeout'), { code: 'ASK_TIMED_OUT' }));
+    await foreground;
+    s.sender.sendMarkdown.mockRejectedValue(new Error('offline'));
+    failSend(new Error('offline'));
+    await vi.runAllTimersAsync();
+    expect(s.channel.hasPending('key')).toBe(true);
+    s.project([{ callId: 'late', state: 'continued', questions: [question()] }]);
+    expect(s.channel.answerText(s.scope, s.peer, 'trusted-owner', 'late', '2').ok).toBe(true);
+    expect(s.service.answer).toHaveBeenCalledOnce();
   });
 
-  it('rejects when the question cannot be delivered at all', async () => {
-    const ch = new QuestionChannel(
-      createManager(),
-      { sendMarkdown: vi.fn(async () => { throw new Error('network down'); }) },
-      { requireMention: false, askTimeoutMs: 60_000 },
-      createLogger(),
-    );
-    const record = makeRecord('sx');
-    await expect(ch.askViaQQ(record, record.replyTarget, { questions: [q2()] }))
-      .rejects.toThrow('failed to deliver question to QQ');
+  it('restores continued calls from host projection for explicit answers and handles queued replies', () => {
+    const s = setup();
+    s.project([{ callId: 'saved', state: 'continued', questions: [question()] }]);
+    expect(s.channel.listPending(s.scope, s.peer, 'user1')).toContain('选哪个');
+    s.service.answer.mockImplementation(() => { throw Object.assign(new Error('queued'), { code: 'REPLY_QUEUED' }); });
+    expect(s.channel.answerText(s.scope, s.peer, 'user1', 'saved', '2')).toEqual({ ok: false, message: '该问题的答案已在队列中。' });
+    expect(s.manager.taskRegistry.noteQuestionAnswer.mock.results[0]!.value).toHaveBeenCalledOnce();
   });
 
-  it('rejects on abort signal', async () => {
-    const sent: SentMessage[] = [];
-    const ch = new QuestionChannel(createManager(), createSender(sent), { requireMention: false, askTimeoutMs: 60_000 }, createLogger());
-    const ac = new AbortController();
-    const p = startAsk(ch, 'c2c', 'U1', [q2()], ac.signal);
-    await sleep(20);
-    ac.abort();
-    await expect(p).rejects.toThrow('aborted');
+  it('stopping a freshly restored session dismisses projected questions before the first card interaction', () => {
+    const s = setup();
+    s.project([{ callId: 'saved', state: 'continued', questions: [question()] }]);
+    s.channel.cancelPending('key', s.record);
+    expect(s.channel.answerText(s.scope, s.peer, 'user1', 'saved', '2').ok).toBe(false);
+    expect(s.service.answer).not.toHaveBeenCalled();
   });
 
-  it('supersedes a previous pending question for the same session', async () => {
-    const sent: SentMessage[] = [];
-    const ch = new QuestionChannel(createManager(), createSender(sent), { requireMention: false, askTimeoutMs: 60_000 }, createLogger());
-    const p1 = startAsk(ch, 'c2c', 'U1', [q2()]);
-    p1.catch(() => {});
-    await sleep(20);
-    const p2 = startAsk(ch, 'c2c', 'U1', [q2()]);
-    await sleep(20);
-    await expect(p1).rejects.toThrow('superseded');
-    ch.tryAnswer('c2c', 'U1', '1');
-    await p2;
+  it('supports replies to a known delivered card but ignores guessed unrelated references', async () => {
+    const s = setup();
+    const result = s.ask();
+    await Promise.resolve();
+    expect(s.channel.tryAnswer(s.scope, s.peer, '2', 'user1', 'unknown')).toBe(false);
+    expect(s.channel.tryAnswer(s.scope, s.peer, '2', 'user1', 'card1')).toBe(true);
+    await result;
   });
 
-  it('times out and rejects when the user never answers', async () => {
-    const sent: SentMessage[] = [];
-    const ch = new QuestionChannel(createManager(), createSender(sent), { requireMention: false, askTimeoutMs: 20 }, createLogger());
-    const p = startAsk(ch, 'c2c', 'U1', [q2()]);
-    p.catch(() => {}); // 抑制超时 reject 早于断言挂 handler 的 unhandled rejection
-    await sleep(80);
-    await expect(p).rejects.toThrow('timed out');
-    expect(sent.some((s) => s.text.includes('超时'))).toBe(true);
+  it('renders approval intent detail and refuses a freeform answer to its fixed actions', async () => {
+    const s = setup();
+    const q = { ...question(), detail: '只允许读取 /tmp/example', intent: { kind: 'approval' as const, approve: 'A', reject: 'B' } };
+    const result = s.ask({ questions: [q], wait: { callId: 'approval-call' } });
+    expect(s.sender.sendMarkdown.mock.calls[0]![1]).toContain(q.detail);
+    expect(s.channel.answerText(s.scope, s.peer, 'user1', 'approval-call', '随便').ok).toBe(false);
+    expect(s.channel.handleInteraction(s.event(s.cardData()))).toBe(true);
+    await result;
   });
 });
 
-describe('QuestionChannel.handleInteraction', () => {
-  function makeEvent(data: string | undefined, peer: { user?: string; group?: string }): InteractionEvent {
-    return {
-      id: 'i1',
-      type: 1,
-      version: 1,
-      ...(peer.group ? { group_openid: peer.group } : {}),
-      ...(peer.user ? { user_openid: peer.user } : {}),
-      data: { type: 1, resolved: { ...(data !== undefined ? { button_data: data } : {}) } },
-    } as InteractionEvent;
-  }
-
-  it('answers a c2c question by button click', async () => {
-    const sent: SentMessage[] = [];
-    const ch = new QuestionChannel(createManager(), createSender(sent), { requireMention: false, askTimeoutMs: 60_000 }, createLogger());
-    const p = startAsk(ch, 'c2c', 'U1', [q2()]);
-    await sleep(20);
-    expect(ch.handleInteraction(makeEvent(JSON.stringify({ t: 'question', q: 'q', i: 1 }), { user: 'U1' }))).toBe(true);
-    expect(await p).toEqual({ answers: [{ id: 'q', selected: ['B'] }] });
+describe('question formatting and parsing', () => {
+  it('keeps original option labels while cards include call and nonce', () => {
+    const keyboard = buildKeyboard(question(), { callId: 'call', nonce: 'nonce' });
+    expect(decodeButtonData(keyboard!.content.rows[0]!.buttons[1]!.action.data)).toEqual({ t: 'question', q: 'q', i: 1, c: 'call', n: 'nonce' });
+    expect(formatQuestion(question(), true, true, 'nonce')).toContain('/answer nonce');
+    expect(buildKeyboard({ ...question(), multiSelect: true })).toBeUndefined();
   });
-
-  it('routes group clicks by group_openid', async () => {
-    const sent: SentMessage[] = [];
-    const ch = new QuestionChannel(createManager(), createSender(sent), { requireMention: false, askTimeoutMs: 60_000 }, createLogger());
-    const p = startAsk(ch, 'group', 'G1', [q2()]);
-    await sleep(20);
-    expect(ch.handleInteraction(makeEvent(JSON.stringify({ t: 'question', q: 'q', i: 0 }), { user: 'someone', group: 'G1' }))).toBe(true);
-    expect(await p).toEqual({ answers: [{ id: 'q', selected: ['A'] }] });
-  });
-
-  it('resolves with the full original label for truncated buttons', async () => {
-    const sent: SentMessage[] = [];
-    const ch = new QuestionChannel(createManager(), createSender(sent), { requireMention: false, askTimeoutMs: 60_000 }, createLogger());
-    const long = '这是一个非常非常长的选项标签超过十八个字符的限制了吧';
-    const p = startAsk(ch, 'c2c', 'U7', [{ id: 'q', question: 't', options: [{ label: long }] }]);
-    await sleep(20);
-    expect(ch.handleInteraction(makeEvent(JSON.stringify({ t: 'question', q: 'q', i: 0 }), { user: 'U7' }))).toBe(true);
-    expect(await p).toEqual({ answers: [{ id: 'q', selected: [long] }] });
-  });
-
-  it('rejects malformed or stale clicks without consuming the question', async () => {
-    const sent: SentMessage[] = [];
-    const ch = new QuestionChannel(createManager(), createSender(sent), { requireMention: false, askTimeoutMs: 60_000 }, createLogger());
-    const p = startAsk(ch, 'c2c', 'U2', [q2()]);
-    await sleep(20);
-    expect(ch.handleInteraction(makeEvent('not-json', { user: 'U2' }))).toBe(false);
-    expect(ch.handleInteraction(makeEvent(JSON.stringify({ t: 'question', q: 'q', i: 9 }), { user: 'U2' }))).toBe(false);
-    // 旧题按钮：q 不等于当前题 id，忽略
-    expect(ch.handleInteraction(makeEvent(JSON.stringify({ t: 'question', q: 'other', i: 0 }), { user: 'U2' }))).toBe(false);
-    expect(ch.handleInteraction(makeEvent(JSON.stringify({ t: 'question', q: 'q', i: 0 }), { user: 'nobody' }))).toBe(false);
-    expect(ch.handleInteraction(makeEvent(undefined, { user: 'U2' }))).toBe(false);
-    ch.tryAnswer('c2c', 'U2', '1');
-    await p;
-  });
-
-  it('ignores a stale click from a previous question after advancing', async () => {
-    const sent: SentMessage[] = [];
-    const ch = new QuestionChannel(createManager(), createSender(sent), { requireMention: false, askTimeoutMs: 60_000 }, createLogger());
-    const q1: UserQuestion = { id: 'a', question: '问题1', options: [{ label: 'A1' }, { label: 'B1' }] };
-    const q2b: UserQuestion = { id: 'b', question: '问题2', options: [{ label: 'A2' }, { label: 'B2' }] };
-    const p = startAsk(ch, 'c2c', 'U1', [q1, q2b]);
-    await sleep(20);
-    // 答第一题（按钮点击），推进到第二题
-    expect(ch.handleInteraction(makeEvent(JSON.stringify({ t: 'question', q: 'a', i: 0 }), { user: 'U1' }))).toBe(true);
-    await sleep(20);
-    expect(sent).toHaveLength(2); // 第二题已发出
-    // 旧题（q=a）按钮在新题发出后被点击 → 忽略，不消费当前题
-    expect(ch.handleInteraction(makeEvent(JSON.stringify({ t: 'question', q: 'a', i: 1 }), { user: 'U1' }))).toBe(false);
-    // 当前题（q=b）仍可正常作答
-    expect(ch.handleInteraction(makeEvent(JSON.stringify({ t: 'question', q: 'b', i: 1 }), { user: 'U1' }))).toBe(true);
-    expect(await p).toEqual({ answers: [{ id: 'a', selected: ['A1'] }, { id: 'b', selected: ['B2'] }] });
-  });
-});
-
-describe('QuestionChannel.cancelPending', () => {
-  it('rejects pending question when the session is evicted', async () => {
-    const sent: SentMessage[] = [];
-    const ch = new QuestionChannel(createManager(), createSender(sent), { requireMention: false, askTimeoutMs: 60_000 }, createLogger());
-    const p = startAsk(ch, 'c2c', 'U1', [q2()]);
-    await sleep(20);
-    ch.cancelPending(sessionKey('c2c', 'U1'));
-    await expect(p).rejects.toThrow('cancelled');
-  });
-});
-
-describe('QuestionChannel.install routing', () => {
-  it('routes QQ sessions to QQ channel and delegates others', async () => {
-    const sent: SentMessage[] = [];
-    const record = makeRecord(sessionKey('c2c', 'u9'));
-    (record as { sessionId?: string }).sessionId = 'sess-qq';
-    const manager = createManager({ findBySessionId: (id) => (id === 'sess-qq' ? record : undefined) });
-    const ch = new QuestionChannel(manager, createSender(sent), { requireMention: false, askTimeoutMs: 60_000 }, createLogger());
-    let origCalled = 0;
-    const uq = { ask: vi.fn(async () => { origCalled += 1; return { answers: [] }; }) };
-    ch.install({ get: (n: string) => (n === 'userQuestions' ? uq : undefined) });
-
-    await uq.ask({ questions: [q2('x')], agent: { id: 'sess-web' } });
-    expect(origCalled).toBe(1);
-
-    const p = uq.ask({ questions: [q2()], agent: { id: 'sess-qq' } });
-    await new Promise((r) => setTimeout(r, 10));
-    expect(ch.tryAnswer('c2c', 'u9', '1')).toBe(true);
-    expect(await p).toEqual({ answers: [{ id: 'q', selected: ['A'] }] });
-    expect(origCalled).toBe(1); // QQ 路径未触碰原实现
-  });
-
-  it('sends the first question to the resolved turn target, follow-ups reply to the answer', async () => {
-    const record = makeRecord(sessionKey('c2c', 'u9'));
-    const manager = createManager({ findBySessionId: (id) => (id === 'sess-qq' ? record : undefined) });
-    const sender = createSender([]);
-    const pushed: ReplyTarget = { scope: 'c2c', targetId: 'x', forceProactive: true };
-    const ch = new QuestionChannel(
-      manager, sender, { requireMention: false, askTimeoutMs: 60_000 }, createLogger(),
-      { targetFor: () => pushed },
-    );
-    const uq = { ask: vi.fn(async () => ({ answers: [] })) };
-    ch.install({ get: (n: string) => (n === 'userQuestions' ? uq : undefined) });
-
-    const p = uq.ask({ questions: [q2('a'), q2('b')], agent: { id: 'sess-qq' } });
-    await sleep(10);
-    expect(sender.sendMarkdown.mock.calls[0]![0]).toEqual(pushed);
-
-    expect(ch.tryAnswer('c2c', 'u9', '1')).toBe(true);
-    await sleep(10);
-    expect(sender.sendMarkdown.mock.calls[1]![0]).toEqual(record.replyTarget);
-
-    expect(ch.tryAnswer('c2c', 'u9', '2')).toBe(true);
-    await p;
-  });
-
-  it('delegates to the host when the turn is not delivered to QQ', async () => {
-    const record = makeRecord(sessionKey('group', 'g1'), 'group');
-    const manager = createManager({ findBySessionId: () => record });
-    const sender = createSender([]);
-    const ch = new QuestionChannel(
-      manager, sender, { requireMention: false, askTimeoutMs: 60_000 }, createLogger(),
-      { targetFor: () => undefined },
-    );
-    const orig = vi.fn(async () => ({ answers: [] }));
-    const uq = { ask: orig };
-    ch.install({ get: (n: string) => (n === 'userQuestions' ? uq : undefined) });
-
-    await uq.ask({ questions: [q2()], agent: { id: 'sess-qq' } });
-
-    expect(orig).toHaveBeenCalledTimes(1);
-    expect(sender.sendMarkdown).not.toHaveBeenCalled();
-  });
-
-  it('uninstall restores the original ask', async () => {
-    const sent: SentMessage[] = [];
-    const ch = new QuestionChannel(createManager(), createSender(sent), { requireMention: false, askTimeoutMs: 60_000 }, createLogger());
-    const uq: { ask: (r: UserQuestionRequest) => Promise<UserQuestionResult>; __qqQuestionPatched?: boolean } = {
-      ask: async () => ({ answers: [] }),
-    };
-    ch.install({ get: (n: string) => (n === 'userQuestions' ? uq : undefined) });
-    expect(uq.__qqQuestionPatched).toBe(true);
-    ch.uninstall();
-    expect(uq.__qqQuestionPatched).toBeUndefined();
-  });
-
-  it('disables gracefully when the userQuestions service is missing', () => {
-    const sent: SentMessage[] = [];
-    const logger = createLogger();
-    const ch = new QuestionChannel(createManager(), createSender(sent), { requireMention: false, askTimeoutMs: 60_000 }, logger);
-    ch.install({ get: () => undefined });
-    expect(logger.warn).not.toHaveBeenCalled();
+  it('maps numbers, labels and free text, and rejects malformed button indices', () => {
+    expect(parseAnswer(question(), '2')).toEqual({ id: 'q', selected: ['B'] });
+    expect(parseAnswer(question(), 'something')).toEqual({ id: 'q', selected: [], custom: 'something' });
+    expect(parseAnswer({ ...question(), multiSelect: true }, '1,2')).toEqual({ id: 'q', selected: ['A', 'B'] });
+    expect(decodeButtonData('{"t":"question","q":"q","i":1.2}')).toBeUndefined();
+    expect(decodeButtonData('{"t":"approval","d":"maybe"}')).toBeUndefined();
   });
 });

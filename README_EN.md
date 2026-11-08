@@ -105,12 +105,39 @@ npx @deepseek-ai/dsh web --patch /path/to/dsh-qqbot/cordis.dev.yml
 | `textChunkLimit` | number | `4500` | Max chars per message |
 | `streaming` | boolean | `true` | Enable streaming output (always disabled in groups) |
 | `sessionIdleTimeout` | number | `1800000` | Session idle timeout (ms), default 30 min; `<=0` disables eviction |
-| `processingTimeoutMs` | number | `1800000` | Processing timeout (ms), aborts the current LLM call |
+| `processingTimeoutMs` | number | `1800000` | Serial SDK processing deadline (ms); does not guarantee cancellation of underlying work |
 | `maxQueue` | number | `20` | Max concurrent queue length |
 | `historyLimit` | number | `10` | Group history buffer size |
 | `askTimeoutMs` | number | `300000` | Question timeout (ms), default 5 min (ask_user_question) |
 | `showToolResults` | boolean | `false` | Show successful tool-call results (errors always shown) |
 | `debug` | boolean | `false` | Debug mode |
+
+### Interactive conversations and background tasks
+
+In **QQ Bot → Basic settings**, enable **执行中接收新消息** ("Accept messages while running") and click **Save**. The switch defaults to off (`conversation.mode: serial`); on selects `interactive`. Saving uses the existing plugin reload flow and stops current execution, so switch after ongoing tasks finish. Send a new message, then use `/bot-status` to verify the effective mode.
+
+The switch changes only the mode, preserving existing timeouts, input limits, and task administrators. You can also set the fields below in the plugin config. Harness `0.2.2-rc.1` provides the steering, managed activation, timed question, and model selection contracts used here. New messages are admitted individually and read at the next agent step, without waiting for the entire task. This does not immediately interrupt an in-flight model request or tool.
+
+```yaml
+conversation:
+  mode: interactive
+  admissionTimeoutMs: 30000
+  maxPendingInputs: 32
+  maxPendingBytes: 262144
+  mainTimeoutMs: 1800000
+  taskTimeoutMs: 3600000
+  taskAdmins: []
+```
+
+`maxQueue` bounds admission, including media preparation. The pending limits bound unclaimed host inputs (bytes are UTF-8). The two execution timeouts are independent; `0` disables a runtime deadline. `processingTimeoutMs` remains a serial-mode SDK setting. There are no environment-variable aliases for these options.
+
+The actual QQ preset must expose local `subagent` / `subagent_fork` and the native control tools. Spawn/Fork support follow-up messages; external backends run one task only. The main agent coordinates, asks questions on behalf of children, and reports results. Enable `mode: timed` and a finite `timeout` in seconds on the `@deepseek-ai/dsh-tool-ask-user` row **inside the active preset's `config.plugins`**. Its default is blocking; `-1` waits indefinitely. Approval never times out into consent.
+
+Use `/tasks` and `/task <id>` for stored outcomes; `/answer` and `/answer <request-id> <answer>` for explicit answers. Buttons and replies quoting a question card also work. Unassociated chat is never interpreted as an answer. `/stop` requests cancellation of the main reply, `/stop <task-id>` targets one run, and `/stop all` drains the tree and releases its root while preserving history for the next message. `/new`, `/reset`, and `/clear` start a new conversation and clear pending QQ interactions; they close plugin-owned trees and detach borrowed host-owned roots. Group controls require the originating user or a configured `taskAdmins` OpenID.
+
+`/model` selects the next step's model on supported hosts, preserving the current step and existing children; older hosts only save the preference for a new conversation. `/bot-status` reports available capabilities. Borrowed host-owned roots cannot be disposed by this plugin, so `/stop all` reports that limitation. `/stop` can still request main-reply cancellation, and `/new` can still switch conversations: it requests cancellation of the old main reply, clears QQ associations and pending interactions, and preserves the old session and history in the host. Unfinished background tasks become unverified; the response explains that they must be inspected or stopped in the host.
+
+Tasks require a live host process. Records under `~/.dsh-qqbot/tasks/` survive restart; unfinished work becomes unverified and is not automatically repeated. The main agent uses `qqbot_report_task` to send stored results and files, recording actual delivery receipts. Retrying delivery does not rerun work, but network ambiguity or partially sent chunks can still cause duplicates. QQ delivery can fail after its reply window closes; stored results remain queryable and delivery is tracked separately. Run `/stop all` before rolling back to serial mode. See the [design and acceptance plan](plans/conversational-background-tasks.md) for details.
 
 ### Access control (access)
 

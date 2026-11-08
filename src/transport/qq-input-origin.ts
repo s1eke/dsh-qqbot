@@ -25,6 +25,16 @@ export interface QqInputRegistryOptions {
   now?: () => number;
 }
 
+interface InputEntry {
+  expiresAt: number;
+  sessionId?: string;
+  bytes: number;
+  pending: boolean;
+  turn?: number;
+  /** Active host-owned input must survive TTL/overflow housekeeping. */
+  pinned: boolean;
+}
+
 /** 按处理超时推导兜底 TTL：排队等待 + 一次完整处理都不应让登记过期 */
 export function inputOriginTtlMs(processingTimeoutMs: number): number {
   const derived = Number.isFinite(processingTimeoutMs) ? processingTimeoutMs * TTL_PROCESSING_FACTOR : 0;
@@ -32,7 +42,7 @@ export function inputOriginTtlMs(processingTimeoutMs: number): number {
 }
 
 export class QqInputRegistry {
-  private readonly entries = new Map<string, number>();
+  private readonly entries = new Map<string, InputEntry>();
   private readonly ttlMs: number;
   private readonly maxEntries: number;
   private readonly now: () => number;
@@ -44,19 +54,21 @@ export class QqInputRegistry {
   }
 
   /** 登记一条本插件入站的消息 id */
-  public register(messageId: string): void {
+  public register(messageId: string, input?: { sessionId: string; bytes: number }): void {
     this.prune();
+    if (input && this.entries.size >= this.maxEntries) throw new Error('QQ 输入登记已满，请稍后重试');
     this.entries.delete(messageId);
-    this.entries.set(messageId, this.now() + this.ttlMs);
+    this.entries.set(messageId, { expiresAt: this.now() + this.ttlMs, sessionId: input?.sessionId,
+      bytes: input?.bytes ?? 0, pending: !!input, pinned: !!input });
     this.evictOverflow();
   }
 
   /** 是否为本插件登记过且未过期的消息。不删除登记。 */
   public has(messageId: string | undefined): boolean {
     if (!messageId) return false;
-    const expiresAt = this.entries.get(messageId);
-    if (expiresAt === undefined) return false;
-    if (expiresAt > this.now()) return true;
+    const entry = this.entries.get(messageId);
+    if (entry === undefined) return false;
+    if (entry.pinned || entry.expiresAt > this.now()) return true;
     this.entries.delete(messageId);
     return false;
   }
@@ -66,20 +78,55 @@ export class QqInputRegistry {
     this.entries.delete(messageId);
   }
 
+  public canAccept(sessionId: string, bytes: number, maxCount: number, maxBytes: number): boolean {
+    let count = 0;
+    let size = bytes;
+    for (const entry of this.entries.values()) {
+      if (entry.sessionId !== sessionId || !entry.pending) continue;
+      count++;
+      size += entry.bytes;
+    }
+    return count < maxCount && size <= maxBytes;
+  }
+
+  public claimed(messageId: string, turn: number): void {
+    const entry = this.entries.get(messageId);
+    if (!entry) return;
+    entry.pending = false;
+    entry.turn = turn;
+  }
+
+  /** Includes claimed inputs rejected before user/message was committed. */
+  public releaseTurn(sessionId: string, turn: number): void {
+    for (const [id, entry] of this.entries) {
+      if (entry.sessionId === sessionId && entry.turn === turn) this.entries.delete(id);
+    }
+  }
+
+  public releaseSession(sessionId: string): void {
+    for (const [id, entry] of this.entries) {
+      if (entry.sessionId === sessionId) this.entries.delete(id);
+    }
+  }
+
+  public hasSession(sessionId: string): boolean {
+    return [...this.entries.values()].some(entry => entry.sessionId === sessionId);
+  }
+
   public get size(): number {
     return this.entries.size;
   }
 
   private prune(): void {
     const now = this.now();
-    for (const [id, expiresAt] of this.entries) {
-      if (expiresAt <= now) this.entries.delete(id);
+    for (const [id, entry] of this.entries) {
+      if (!entry.pinned && entry.expiresAt <= now) this.entries.delete(id);
     }
   }
 
   private evictOverflow(): void {
     while (this.entries.size > this.maxEntries) {
-      const oldest = this.entries.keys().next().value;
+      const oldest = [...this.entries].find(([, entry]) => !entry.pinned)?.[0];
       if (oldest === undefined) return;
       this.entries.delete(oldest);
     }

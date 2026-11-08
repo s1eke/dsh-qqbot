@@ -16,7 +16,10 @@ import type { QQBotSender } from './outbound-buffer.ts';
 /** 交付物投递器（outbound 路由只依赖此接口，便于测试注入） */
 export interface DeliverablesDelivererLike {
   deliver: (target: ReplyTarget, files: PresentedFileRef[]) => Promise<void>;
+  deliverWithReceipt?: (target: ReplyTarget, files: PresentedFileRef[], beforeEach?: () => void) => Promise<DeliverablesReceipt>;
 }
+
+export interface DeliverablesReceipt { sent: number; missed: string[] }
 
 export class DeliverablesDeliverer implements DeliverablesDelivererLike {
   private readonly sender: QQBotSender;
@@ -38,12 +41,17 @@ export class DeliverablesDeliverer implements DeliverablesDelivererLike {
 
   /** 轮末投递一批声明文件到本回合目标：逐个发送，未送达的聚合为一条文字提示 */
   public async deliver(target: ReplyTarget, files: PresentedFileRef[]): Promise<void> {
+    await this.deliverWithReceipt(target, files);
+  }
+
+  public async deliverWithReceipt(target: ReplyTarget, files: PresentedFileRef[], beforeEach?: () => void): Promise<DeliverablesReceipt> {
     const limit = Math.max(1, this.config.sendFile?.maxFiles ?? 4);
     const cwd = resolveAgentCwd(this.config.cwd);
     const missed: string[] = [];
     let sent = 0;
 
     for (const [index, file] of files.entries()) {
+      beforeEach?.();
       // 新声明记录绝对路径；历史相对路径按 agent 工作目录（workspace）兜底解析
       const absPath = isAbsolute(file.path) ? file.path : resolve(cwd, file.path);
       const display = basename(absPath);
@@ -73,6 +81,7 @@ export class DeliverablesDeliverer implements DeliverablesDelivererLike {
     if (missed.length > 0) {
       const text = ['📎 已生成文件（未能直接发送）：', ...missed.map((name) => `- ${name}`)].join('\n');
       for (const chunk of chunkMarkdownText(text, this.config.textChunkLimit)) {
+        beforeEach?.();
         try {
           await this.sender.sendMarkdown(target, chunk);
         } catch (err) {
@@ -83,5 +92,6 @@ export class DeliverablesDeliverer implements DeliverablesDelivererLike {
       }
     }
     this.logger.debug(`im-qqbot: deliverables delivered sent=${sent} missed=${missed.length}`);
+    return { sent, missed };
   }
 }

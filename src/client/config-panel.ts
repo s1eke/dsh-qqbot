@@ -37,6 +37,7 @@ type ConfigWire = {
   groupPrompt?: string;
   directPrompt?: string;
   access?: AccessControlWire;
+  conversation?: { mode: 'serial' | 'interactive' };
   cwd?: string;
 };
 
@@ -269,8 +270,13 @@ export function ConfigPanel(props: { bindPhase?: string } = {}): ReactNode {
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const body = (await res.json()) as { config: ConfigWire };
         if (stopped) return;
-        setInitial(body.config);
-        setForm(body.config);
+        // 面板只编辑模式；不把宿主返回的高级 conversation 参数带回保存请求。
+        const config: ConfigWire = {
+          ...body.config,
+          conversation: { mode: body.config.conversation?.mode ?? 'serial' },
+        };
+        setInitial(config);
+        setForm(config);
       })
       .catch((err: unknown) => {
         if (!stopped) setLoadError(err instanceof Error ? err.message : String(err));
@@ -362,6 +368,11 @@ export function ConfigPanel(props: { bindPhase?: string } = {}): ReactNode {
       : null,
 
     createElement('div', { className: 'imqb2-group-title' }, '基础设置'),
+    createElement(SwitchRow, {
+      label: '执行中接收新消息', checked: form.conversation?.mode === 'interactive',
+      help: '开启后，任务执行中也能接收新消息，在下一执行步骤读取；关闭后，后续消息等待当前任务结束。不会立即打断正在运行的工具。',
+      onChange: (v) => { patch('conversation', { mode: v ? 'interactive' : 'serial' }); },
+    }),
     createElement(SwitchRow, {
       label: '群聊仅回复 @机器人的消息', checked: form.requireMention ?? true,
       help: '开启后，机器人仅可回复 @机器人的群聊消息',

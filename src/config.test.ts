@@ -2,6 +2,13 @@ import { describe, it, expect } from 'vitest';
 import { ConfigSchema } from './config.ts';
 
 describe('ConfigSchema 默认值（内层外层默认必须对齐：#94-1 不变量）', () => {
+  it('conversation defaults to serial and validates bounded input/timeout values', () => {
+    expect(ConfigSchema({}).conversation?.mode).toBe('serial');
+    expect(ConfigSchema({conversation:{mode:'interactive'}}).conversation?.maxPendingInputs).toBe(32);
+    expect(() => ConfigSchema({conversation:{admissionTimeoutMs:0}})).toThrow();
+    expect(() => ConfigSchema({conversation:{maxPendingInputs:-1}})).toThrow();
+    expect(() => ConfigSchema({conversation:{taskTimeoutMs:-1}})).toThrow();
+  });
   it('完全省略 access → c2cMode open（子 schema 默认生效）', () => {
     const cfg = ConfigSchema({});
     expect(cfg.access.c2cMode).toBe('open');

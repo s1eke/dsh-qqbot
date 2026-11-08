@@ -92,7 +92,7 @@ const EDITABLE_CONFIG_KEYS = new Set([
   'requireMention', 'streaming', 'showToolResults', 'debug',
   'provider', 'model', 'preset',
   'groupPrompt', 'directPrompt',
-  'access',
+  'access', 'conversation',
 ]);
 
 /** 白名单键的子 Schema（服务端校验：客户端校验仅为体验，安全边界在宿主） */
@@ -107,7 +107,23 @@ const EDITABLE_CONFIG_SCHEMAS: Record<string, (value: unknown) => unknown> = {
   groupPrompt: stringSchema('groupPrompt'),
   directPrompt: stringSchema('directPrompt'),
   access: (v) => AccessControlSchema(v as never),
+  conversation: conversationModeSchema,
 };
+
+/** The settings panel owns only the mode switch, not advanced conversation configuration. */
+function conversationModeSchema(value: unknown): { mode: 'serial' | 'interactive' } {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    throw new TypeError('conversation 必须是仅包含 mode 的对象');
+  }
+  const patch = value as Record<string, unknown>;
+  for (const key of Object.keys(patch)) {
+    if (key !== 'mode') throw new TypeError(`不支持的字段: conversation.${key}`);
+  }
+  if (patch.mode !== 'serial' && patch.mode !== 'interactive') {
+    throw new TypeError('conversation.mode 必须是 serial 或 interactive');
+  }
+  return { mode: patch.mode };
+}
 
 function booleanSchema(value: unknown, name: string): boolean {
   if (typeof value !== 'boolean') throw new TypeError(`${name} 必须是布尔值`);

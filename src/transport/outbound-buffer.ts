@@ -68,8 +68,9 @@ export class OutboundBuffer {
   }
 
   /** 发送所有累积文本：流式优先，降级静态 */
-  public async flush(): Promise<void> {
+  public async flush(shouldSend: () => boolean = () => true): Promise<void> {
     if (this.flushing || !this.buffer.trim()) return;
+    if (!shouldSend()) { this.cancel(); return; }
     this.flushing = true;
 
     try {
@@ -82,6 +83,7 @@ export class OutboundBuffer {
       // 降级：静态发送（writer 不存在 or 流式失败）
       const chunks = chunkMarkdownText(this.buffer, this.limit);
       for (const chunk of chunks) {
+        if (!shouldSend()) return;
         await this.bot.sendMarkdown(this.target, chunk);
       }
     } catch (err) {

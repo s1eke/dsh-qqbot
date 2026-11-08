@@ -29,6 +29,8 @@ export interface QQPromptEntry {
   extraPrompts(): { group?: string; direct?: string };
   /** Read only the current turn's verified input; queued and previous turns return nothing. */
   turnContext?(): QQTurnContext | undefined;
+  /** Verified native task capabilities and a bounded task summary. */
+  conversationContext?(): string;
 }
 
 /** 已安装的 QQ prompt 注册项。 */
@@ -45,6 +47,10 @@ export function installQQPrompt(agentCtx: Context, entry: QQPromptEntry): QQProm
   disposers.push(service.section({ name: RULES_SECTION_NAME, order: RULES_ORDER, text: RULES_TEXT }));
   disposers.push(service.section({ name: PERSONA_SECTION_NAME, order: PERSONA_ORDER, text: () => selectPersonaText(entry.personaCard(), entry.scope) }));
   disposers.push(service.section({ name: EXTRA_SECTION_NAME, order: EXTRA_ORDER, text: () => selectExtraPrompt(entry.extraPrompts(), entry.scope) }));
+  if (entry.conversationContext) {
+    disposers.push(service.context({ name: 'qqbot:conversation', order: TURN_META_ORDER + 2,
+      text: () => entry.conversationContext?.() ?? '', interpolate: false } as Parameters<Context['systemPrompt']['context']>[0]));
+  }
   // The Host claims its inbox before assembly, but appends user/message only after
   // assembly. Resolve the durable claim instead of observing the previous input.
   // interpolate: false 防止用户文本中的 {{...}} 被插值；旧版类型无此字段，push 处断言桥接。

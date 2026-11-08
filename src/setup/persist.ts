@@ -14,7 +14,7 @@
  */
 import { resolve } from 'node:path';
 import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
-import { parseDocument, isMap, isSeq, isScalar, YAMLMap, type Document, type YAMLSeq } from 'yaml';
+import { parseDocument, isAlias, isMap, isSeq, isScalar, Scalar, YAMLMap, type Document, type YAMLSeq } from 'yaml';
 import type { Logger } from '../types.ts';
 
 /** 凭据结果 */
@@ -329,7 +329,8 @@ export function removeCredentialsFromProfile(
  * 最小写入原则：只把「本次提交的顶层键」合并进条目 config——
  * 不固化 bundle patch 的默认值（保持其版本演进的覆盖能力），
  * 不触碰已保存的凭据字段（appId/appSecret 由绑定/更换/解绑流程管理）。
- * 嵌套对象（如 access）按顶层键整体替换，避免部分合并出混合态。
+ * conversation 仅修改 mode，保留用户配置的期限、配额、管理员及注释；
+ * 其余嵌套对象（如 access）按顶层键整体替换，避免部分合并出混合态。
  * 写入触发 HMR 重载，新 fiber 以新配置启动。
  */
 export function updateProfileConfig(
@@ -350,13 +351,19 @@ export function updateProfileConfig(
       ({ config, attached, appendEntry }) => {
         for (const [key, value] of Object.entries(configPatch)) {
           if (key === 'appId' || key === 'appSecret') continue;
-          config.set(key, value);
+          if (key === 'conversation') updateConversationMode(config, value);
+          else config.set(key, value);
         }
         if (!attached) appendEntry();
         return true;
       },
       {},
-      (config) => config !== undefined,
+      (config) => {
+        if (config === undefined) return false;
+        if (!Object.hasOwn(configPatch, 'conversation')) return true;
+        const conversation: unknown = config.get('conversation', true);
+        return isMap(conversation) && conversation.get('mode') === (configPatch.conversation as { mode: unknown }).mode;
+      },
       log,
     );
     if (ok) {
@@ -371,6 +378,41 @@ export function updateProfileConfig(
     }
     log.warn(`保存配置失败: ${err instanceof Error ? err.message : String(err)}`);
     return false;
+  }
+}
+
+/** Edit the owned leaf only; aliases or anchors could otherwise change another consumer's settings. */
+function updateConversationMode(config: YAMLMap, value: unknown): void {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    throw new PatchFormatError('conversation 更新必须是仅包含 mode 的对象');
+  }
+  const patch = value as Record<string, unknown>;
+  if (Object.keys(patch).some(key => key !== 'mode') || (patch.mode !== 'serial' && patch.mode !== 'interactive')) {
+    throw new PatchFormatError('conversation 更新只允许 mode: serial 或 interactive');
+  }
+  let conversation: unknown = config.get('conversation', true);
+  if (conversation === undefined) {
+    conversation = new YAMLMap();
+    config.set('conversation', conversation);
+  }
+  if (!isMap(conversation) || conversation.anchor) {
+    throw new PatchFormatError('conversation 必须是未被锚点共享的映射，不能修改别名或其他类型');
+  }
+  const existing = conversation.get('mode', true);
+  if (isAlias(existing) || (existing && typeof existing === 'object' && 'anchor' in existing && existing.anchor)) {
+    throw new PatchFormatError('conversation.mode 被锚点共享或使用别名，拒绝覆盖');
+  }
+  if (isScalar(existing) && !existing.tag) {
+    existing.value = patch.mode;
+  } else {
+    const mode = new Scalar(patch.mode);
+    if (existing && typeof existing === 'object') {
+      // Replacing a tagged expression must produce a literal while keeping the user's comments.
+      if ('comment' in existing) mode.comment = existing.comment as string | null;
+      if ('commentBefore' in existing) mode.commentBefore = existing.commentBefore as string | null;
+      if ('spaceBefore' in existing) mode.spaceBefore = existing.spaceBefore as boolean;
+    }
+    conversation.set('mode', mode);
   }
 }
 

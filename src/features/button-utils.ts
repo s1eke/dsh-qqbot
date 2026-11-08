@@ -21,11 +21,13 @@ export function buttonLabel(text: string | undefined): string {
 
 // ── button_data 统一编码 ──
 
-/** 问答按钮：q=问题 id，i=选项下标 */
+/** 问答按钮：q=问题 id，i=选项下标，c=调用 id，n=卡片 nonce。通道要求 c/n。 */
 export interface QuestionButtonData {
   t: 'question';
   q: string;
   i: number;
+  c?: string;
+  n?: string;
 }
 
 /** 审批按钮：d=决策，n=本审批的 nonce（与 pending 匹配，防旧卡片混淆 #94-3） */
@@ -45,10 +47,14 @@ export function encodeButtonData(data: ButtonData): string {
 /** 解码 button_data；非法 JSON 或缺少合法 `t` 时返回 undefined */
 export function decodeButtonData(raw: string): ButtonData | undefined {
   try {
-    const parsed = JSON.parse(raw) as Partial<ButtonData>;
-    if (parsed !== null && typeof parsed === 'object' && (parsed.t === 'question' || parsed.t === 'approval')) {
-      return parsed as ButtonData;
-    }
+    const parsed: unknown = JSON.parse(raw);
+    if (parsed === null || typeof parsed !== 'object' || !('t' in parsed)) return undefined;
+    if (parsed.t === 'question' && 'q' in parsed && typeof parsed.q === 'string'
+      && 'i' in parsed && typeof parsed.i === 'number' && Number.isSafeInteger(parsed.i) && parsed.i >= 0
+      && (!('c' in parsed) || typeof parsed.c === 'string')
+      && (!('n' in parsed) || typeof parsed.n === 'string')) return parsed as QuestionButtonData;
+    if (parsed.t === 'approval' && 'd' in parsed && (parsed.d === 'allow' || parsed.d === 'deny')
+      && (!('n' in parsed) || typeof parsed.n === 'string')) return parsed as ApprovalButtonData;
   } catch {
     // fall through
   }

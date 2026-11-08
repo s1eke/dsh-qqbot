@@ -16,10 +16,21 @@ export function newCommand({ manager }: CommandDeps): CategorizedCommand {
     category: 'agent',
     scope: 'all',
     description: '开始新会话（清空上下文）',
-    handler: (cmdCtx) => {
+    handler: async (cmdCtx) => {
       const { scope, peerId } = getScopePeer(cmdCtx);
-      void manager.remove(scope, peerId);
-      return '已开启新会话 ✓';
+      if (!manager.canControl(scope, peerId, cmdCtx.message.senderId, 'all')) {
+        return '当前有其他成员的工作，只有任务发起人或任务管理员可以重置会话。';
+      }
+      try {
+        const outcome = await manager.remove(scope, peerId);
+        if (outcome.detached) {
+          return '已开启新会话 ✓\n已请求停止旧主回复；旧会话仍保留在宿主中。'
+            + (outcome.backgroundActive ? '旧后台任务尚未确认结束，请在宿主中查看或停止。' : '');
+        }
+        return '已开启新会话 ✓';
+      } catch (err) {
+        return `新会话未开启：${err instanceof Error ? err.message : String(err)}`;
+      }
     },
   };
 }

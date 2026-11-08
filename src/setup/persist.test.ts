@@ -194,6 +194,47 @@ describe('removeCredentialsFromProfile', () => {
 });
 
 describe('updateProfileConfig', () => {
+  it('未配置 conversation 时只写入 mode，不固化任何高级默认值', () => {
+    expect(updateProfileConfig({ conversation: { mode: 'interactive' } }, dir, log)).toBe(true);
+    expect(parseDocument(readFileSync(patchPath, 'utf8')).toJS()).toEqual([
+      { id: 'im-qqbot', config: { conversation: { mode: 'interactive' } } },
+    ]);
+  });
+
+  it('模式同值提交保持原注释且不触发写入，覆盖表达式时写入字面量', () => {
+    writeFileSync(patchPath, '- id: im-qqbot\n  config:\n    conversation:\n      mode: "serial" # 保留开关说明\n', 'utf8');
+    const past = new Date(Date.now() - 1000);
+    utimesSync(patchPath, past, past);
+    expect(updateProfileConfig({ conversation: { mode: 'serial' } }, dir, log)).toBe(true);
+    expect(statSync(patchPath).mtimeMs).toBe(past.getTime());
+    writeFileSync(patchPath, '- id: im-qqbot\n  config:\n    conversation:\n      mode: !!js env.MODE # 保留开关说明\n', 'utf8');
+    expect(updateProfileConfig({ conversation: { mode: 'interactive' } }, dir, log)).toBe(true);
+    const after = readFileSync(patchPath, 'utf8');
+    expect(after).toContain('# 保留开关说明');
+    expect(after).not.toContain('!!js');
+    expect(parseDocument(after).toJS()[0].config.conversation).toEqual({ mode: 'interactive' });
+  });
+
+  it.each([
+    '- id: im-qqbot\n  config:\n    conversation: &shared { mode: serial }\n- id: other\n  config: *shared\n',
+    '- id: other\n  config: &shared { mode: serial }\n- id: im-qqbot\n  config:\n    conversation: *shared\n',
+    '- id: im-qqbot\n  config:\n    conversation: null\n',
+    '- id: im-qqbot\n  config:\n    conversation: [serial]\n',
+    '- id: im-qqbot\n  config:\n    conversation: !!js env.CONVERSATION\n',
+    '- id: im-qqbot\n  config:\n    conversation:\n      mode: &shared serial\n- id: other\n  config: { mode: *shared }\n',
+    '- id: other\n  config: { mode: &shared serial }\n- id: im-qqbot\n  config:\n    conversation:\n      mode: *shared\n',
+  ])('不能安全修改 conversation 时原文件完整保留：%s', (content) => {
+    writeFileSync(patchPath, content, 'utf8');
+    expect(updateProfileConfig({ requireMention: false, conversation: { mode: 'interactive' } }, dir, log)).toBe(false);
+    expect(readFileSync(patchPath, 'utf8')).toBe(content);
+  });
+
+  it('直接保存也拒绝越权高级字段，不把 conversation 整体替换', () => {
+    writeFileSync(patchPath, SHARED_PATCH, 'utf8');
+    expect(updateProfileConfig({ conversation: { mode: 'interactive', taskAdmins: ['other'] } }, dir, log)).toBe(false);
+    expect(readFileSync(patchPath, 'utf8')).toBe(SHARED_PATCH);
+  });
+
   it('最小写入：只合并提交键，不触碰凭据字段', () => {
     writeFileSync(patchPath, SHARED_PATCH, 'utf8');
 

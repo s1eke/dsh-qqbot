@@ -12,7 +12,8 @@ import type { ContentBlock } from '@deepseek-ai/dsh-llm';
 import { createUserMessage } from '@deepseek-ai/dsh-llm';
 import type { QqInputRegistry } from './qq-input-origin.ts';
 import type { SessionManager } from '../session/index.ts';
-import type { ImQQBotConfig } from '../config.ts';
+import { conversationConfig, type ImQQBotConfig } from '../config.ts';
+import { admissionTicket } from '../middleware/admission.ts';
 import type { ChatScope, Logger, QuotedAttachment, RawAttachment, ReplyTarget } from '../types.ts';
 import {
   classifyContentType,
@@ -99,6 +100,12 @@ export async function handleInbound(
 
   const scope: ChatScope = msg.kind === 'group' ? 'group' : 'c2c';
   const peerId = scope === 'group' ? (msg.groupOpenid ?? msg.senderId) : msg.senderId;
+  const ticket = admissionTicket(ctx);
+  const generation = ticket?.generation ?? manager.generation(scope, peerId);
+  const valid = () => !ticket?.signal.aborted && manager.isCurrent(scope, peerId, generation);
+  if (!valid()) return;
+  const settings = conversationConfig(config);
+  const interactive = settings.mode === 'interactive';
 
   const replyTarget: ReplyTarget = {
     scope,
@@ -116,8 +123,9 @@ export async function handleInbound(
   // ── 获取或创建会话 ──
   let record;
   try {
-    record = await manager.getOrCreate(scope, peerId, msg.senderId, replyTarget);
+    record = await manager.getOrCreate(scope, peerId, msg.senderId, replyTarget, generation);
   } catch (err) {
+    if (!valid()) return;
     logger.error(`ERROR creating session: ${err instanceof Error ? err.message : String(err)}`);
     // 兜底回复：会话创建失败时告知用户，避免静默无响应
     try {
@@ -125,6 +133,11 @@ export async function handleInbound(
     } catch (sendErr) {
       logger.error(`fallback reply failed: ${sendErr instanceof Error ? sendErr.message : String(sendErr)}`);
     }
+    return;
+  }
+  if (!valid()) return;
+  if (interactive && typeof record.agent.steer !== 'function') {
+    await bot.sendMarkdown(replyTarget, '当前宿主缺少 steer 接口，无法使用交互模式；请升级 Harness 或切回 conversation.mode: serial。');
     return;
   }
 
@@ -138,16 +151,33 @@ export async function handleInbound(
 
   // 按宿主保证跨边界不变的 Message.id 登记 QQ 入站，出站据此认领回合归属
   //（不在 source 上写非契约字段，也不在 SessionRecord 上抢标记）。
-  inputs.register(String(message.id));
-  record.agent.followup(message);
-  logger.info(`→ followup sent: key=${scope}:${peerId}`);
+  const bytes = Buffer.byteLength(agentBody, 'utf8');
+  if (interactive && !inputs.canAccept(record.sessionId, bytes, settings.maxPendingInputs, settings.maxPendingBytes)) {
+    await bot.sendMarkdown(replyTarget, '尚未处理的输入已达到上限，请等待片刻；查询和停止命令仍可使用。');
+    return;
+  }
+  try {
+    inputs.register(String(message.id), interactive ? { sessionId: record.sessionId, bytes } : undefined);
+    manager.taskRegistry?.noteInput(String(message.id), msg.senderId,
+      { generation, rootSessionId: record.sessionId, qqMessageId: msg.messageId });
+    if (interactive) record.agent.steer!(message);
+    else record.agent.followup(message);
+  } catch (err) {
+    inputs.release(String(message.id));
+    manager.taskRegistry?.forgetInput(String(message.id));
+    logger.warn(`input rejected: ${err instanceof Error ? err.message : String(err)}`);
+    await bot.sendMarkdown(replyTarget, '⚠️ 消息未被宿主接收，请稍后重试。');
+    return;
+  }
+  logger.info(`→ ${interactive ? 'steer' : 'followup'} accepted: key=${scope}:${peerId} messageId=${String(message.id)}`);
 
   // 群消息回复后清空历史缓存（避免下次 @ 时重复组包）
   if (scope === 'group') {
     clearGroupHistory(config.appId, msg.groupOpenid ?? msg.senderId);
   }
 
-  // 阻塞等待本轮 turn 收敛，避免后续消息在 turn 运行期间被 followup 打断
+  if (interactive) return;
+  // serial 保持旧行为：接入队列覆盖完整代理活动。
   try {
     await record.agent.whenIdle();
   } catch (err) {

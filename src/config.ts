@@ -65,6 +65,29 @@ export interface ProactiveDeliveryConfig {
   externalTurns: ExternalTurnDelivery;
 }
 
+export interface ConversationConfig {
+  mode: 'serial' | 'interactive';
+  /** 从收到消息到接入宿主的截止时间，包括队列与附件准备。 */
+  admissionTimeoutMs: number;
+  maxPendingInputs: number;
+  maxPendingBytes: number;
+  /** 绑定确切 turn / activation；0 表示不设置运行期限。 */
+  mainTimeoutMs: number;
+  taskTimeoutMs: number;
+  /** 群任务管理员 QQ openid；任务发起人始终可以操作自己的任务。 */
+  taskAdmins: string[];
+}
+
+export const CONVERSATION_DEFAULTS: ConversationConfig = {
+  mode: 'serial', admissionTimeoutMs: 30_000,
+  maxPendingInputs: 32, maxPendingBytes: 256 * 1024,
+  mainTimeoutMs: 30 * 60_000, taskTimeoutMs: 60 * 60_000, taskAdmins: [],
+};
+
+export function conversationConfig(config: Pick<ImQQBotConfig, 'conversation'>): ConversationConfig {
+  return { ...CONVERSATION_DEFAULTS, ...config.conversation };
+}
+
 export interface ImQQBotConfig {
   /** QQ Bot AppID */
   appId: string;
@@ -91,8 +114,10 @@ export interface ImQQBotConfig {
   sessionIdleTimeout: number;
   /** 并发队列最大长度 */
   maxQueue: number;
-  /** 处理超时(ms)，超时中断当前 LLM 调用 */
+  /** serial 模式 SDK 处理期限；不保证取消底层模型调用。 */
   processingTimeoutMs: number;
+  /** 新模式显式开启，省略保持串行兼容。 */
+  conversation?: ConversationConfig;
   /** 待答问题超时(ms)，超时自动拒绝并提示（ask_user_question） */
   askTimeoutMs: number;
   /** 群历史缓冲条数 */
@@ -135,7 +160,16 @@ export const ConfigSchema: Schema<ImQQBotConfig> = Schema.object({
   streaming: Schema.boolean().default(true).description('是否启用流式输出（群聊始终不启用）'),
   sessionIdleTimeout: Schema.number().default(30 * 60 * 1000).description('会话闲置超时(ms)，<=0 不回收'),
   maxQueue: Schema.number().default(20).description('并发队列最大长度'),
-  processingTimeoutMs: Schema.number().default(30 * 60 * 1000).description('处理超时(ms)，超时中断当前 LLM 调用'),
+  processingTimeoutMs: Schema.number().default(30 * 60 * 1000).description('serial 模式 SDK 处理期限(ms)，不保证取消底层执行'),
+  conversation: Schema.object({
+    mode: Schema.union(['serial', 'interactive']).default('serial').description('对话模式：interactive 可在执行中接收补充'),
+    admissionTimeoutMs: Schema.number().min(1).step(1).default(30_000).description('消息接入截止时间(ms)，包括排队与附件准备'),
+    maxPendingInputs: Schema.number().min(1).step(1).default(32).description('每会话宿主未领取输入数量上限'),
+    maxPendingBytes: Schema.number().min(1).step(1).default(256 * 1024).description('每会话未领取输入 UTF-8 字节上限'),
+    mainTimeoutMs: Schema.number().min(0).step(1).default(30 * 60_000).description('主会话每轮运行期限(ms)，0 不限'),
+    taskTimeoutMs: Schema.number().min(0).step(1).default(60 * 60_000).description('后台每次 activation 运行期限(ms)，0 不限'),
+    taskAdmins: Schema.array(Schema.string()).default([]).description('可操作群内其他用户任务的 QQ openid'),
+  }).default(CONVERSATION_DEFAULTS).description('持续对话与后台任务'),
   askTimeoutMs: Schema.number().default(5 * 60 * 1000).description('待答问题超时(ms)，超时自动拒绝并提示'),
   historyLimit: Schema.number().default(10).description('群历史缓冲条数'),
   access: AccessControlSchema.default({

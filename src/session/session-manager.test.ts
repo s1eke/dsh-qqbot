@@ -131,6 +131,7 @@ function createManagerWithCtx(
   registry: Pick<DshAgentRegistry, 'get' | 'resume' | 'create'>,
   ctx: Context,
   logger: Logger = createLogger(),
+  overrides: Partial<ImQQBotConfig> = {},
 ) {
   const config = ConfigSchema({
     appId: APP_ID,
@@ -139,6 +140,7 @@ function createManagerWithCtx(
     model: 'm',
     cwd: join(env.home, 'workspace'),
     sessionIdleTimeout: 0,
+    ...overrides,
   } as ImQQBotConfig);
   const manager = new SessionManager(ctx, registry as DshAgentRegistry, config, logger);
   managers.push(manager);
@@ -347,21 +349,22 @@ describe('getOrCreate — E1 resume 失败按会话是否存在分流', () => {
 });
 
 describe('getOrCreate — E2 确定性 id 不进入新建路径', () => {
-  it('E2-1 resume(legacy) 期间 /new 写入新 id → 采用 prefs 最新 id 新建，内存与 prefs 一致', async () => {
+  it('E2-1 /new 使在途 resume 失效，旧请求不能创建或覆盖新映射', async () => {
     const pending = deferred<DshAgentHandle>();
     const { registry } = createRegistry(() => pending.promise);
     const manager = createManager(registry);
 
     const creating = manager.getOrCreate('c2c', PEER, PEER, REPLY);
+    const rejected = expect(creating).rejects.toThrow(/已停止或重置/);
     await vi.waitFor(() => expect(registry.resume).toHaveBeenCalled());
-    await manager.remove('c2c', PEER); // /new：同步把 prefs 写为新铸 id
+    const resetting = manager.remove('c2c', PEER);
     pending.reject(notFound(LEGACY_ID));
-    const record = await creating;
+    await Promise.all([rejected, resetting]);
 
-    expect(record.sessionId).toMatch(MINTED);
-    expect(record.sessionId).not.toBe(LEGACY_ID);
-    expect(createdIds(registry)).toEqual([record.sessionId]);
-    expect(persistedId()).toBe(record.sessionId); // 重启后仍是同一会话
+    expect(registry.create).not.toHaveBeenCalled();
+    expect(manager.size).toBe(0);
+    expect(persistedId()).toMatch(MINTED);
+    expect(persistedId()).not.toBe(LEGACY_ID);
   });
 
   it('E2-2 /compact 拉起与普通消息并发 getOrCreate → singleflight 合并为一次 resume/create，无 agent 泄漏', async () => {
@@ -493,7 +496,7 @@ describe('QQ prompt 注册生命周期（per-agent 安装 / 释放 / live 复用
     let live: DshAgent | undefined;
     const created: Array<{ agent: DshAgent; sections: Map<string, unknown>; contexts: Map<string, unknown> }> = [];
     const registry = {
-      get: vi.fn(() => live),
+      get: vi.fn((id: string) => live?.id === id ? live : undefined),
       resume: vi.fn(async ({ resumeSessionId }: { resumeSessionId: string }) => { throw notFound(resumeSessionId); }),
       create: vi.fn(async (options: { sessionId: string }) => {
         const { agent, sections, contexts } = promptAgent(options.sessionId, opts);
@@ -505,14 +508,14 @@ describe('QQ prompt 注册生命周期（per-agent 安装 / 释放 / live 复用
     return { registry, created };
   }
 
-  it('会话建立即注册 4 个 section + 2 个 context；remove() 全部释放', async () => {
+  it('会话建立注册 QQ 提示与交互上下文；remove() 全部释放', async () => {
     const { registry, created } = promptRegistry();
     const manager = createManager(registry);
 
     await manager.getOrCreate('c2c', PEER, PEER, REPLY);
     expect(created).toHaveLength(1);
     expect([...created[0].sections.keys()].sort()).toEqual(['qqbot:extra', 'qqbot:persona', 'qqbot:rules']);
-    expect([...created[0].contexts.keys()].sort()).toEqual(['qqbot:background', 'qqbot:turn-meta']);
+    expect([...created[0].contexts.keys()].sort()).toEqual(['qqbot:background', 'qqbot:conversation', 'qqbot:turn-meta']);
 
     await manager.remove('c2c', PEER);
     expect(created[0].sections.size).toBe(0);
@@ -546,16 +549,16 @@ describe('QQ prompt 注册生命周期（per-agent 安装 / 释放 / live 复用
     const agent = created[0].agent;
 
     // 回收（releasePrompt 释放注册，但 registry 中 agent A 仍存活——宿主未必同步销毁）
-    await manager.remove('c2c', PEER);
+    await manager.disposeAll();
     expect(created[0].sections.size).toBe(0);
 
-    // 第二次 getOrCreate：prefs 指向 remove 时铸造的新 id，registry.get 命中 A → live 复用
-    const record = await manager.getOrCreate('c2c', PEER, PEER, REPLY);
+    // 重新加载插件：prefs 仍指向原 id，registry.get 命中 A → live 复用
+    const record = await createManager(registry).getOrCreate('c2c', PEER, PEER, REPLY);
     expect(record.agent).toBe(agent);
     expect(registry.create).toHaveBeenCalledTimes(1); // 未重建 agent，纯复用
     // 关键回归：prompt 必须重新注册，而不是因"已安装"标记被跳过
     expect(created[0].sections.size).toBe(3);
-    expect(created[0].contexts.size).toBe(2);
+    expect(created[0].contexts.size).toBe(3);
   });
 
   it('disposeAll 同样释放 prompt 注册项', async () => {
@@ -578,7 +581,385 @@ describe('QQ prompt 注册生命周期（per-agent 安装 / 释放 / live 复用
     expect(allLogText(logger)).toContain('qq prompt install failed');
 
     // 失败不入表：同 agent 再次触发安装时重试（此处模拟再次 remove→复用）
-    expect(manager.remove('c2c', PEER)).resolves.toBeUndefined();
+    await expect(manager.remove('c2c', PEER)).resolves.toEqual({ detached: false, backgroundActive: false });
     expect(created[0].sections.size).toBe(0);
+  });
+});
+
+describe('会话接入代次与关闭屏障', () => {
+  function servicesCtx(services: Record<string, unknown>): Context {
+    return {
+      get: (name: string) => services[name] ?? (name === 'sessionPersistence' ? { stat: async () => undefined } : undefined),
+      on: vi.fn(),
+    } as unknown as Context;
+  }
+
+  it('下载后到达的旧输入在 /stop 后被拒绝，命令后的输入可接收', async () => {
+    const { registry } = createRegistry(async ({ resumeSessionId }) => { throw notFound(resumeSessionId); });
+    const manager = createManager(registry);
+    const generation = manager.generation('c2c', PEER);
+    const release = manager.holdActivity('c2c', PEER, 'input', generation);
+    const outcome = await manager.stop('c2c', PEER);
+    expect(outcome.stopped).toBe(true);
+    await expect(manager.getOrCreate('c2c', PEER, PEER, REPLY, generation)).rejects.toThrow(/已停止或重置/);
+    expect(registry.create).not.toHaveBeenCalled();
+    release();
+    release();
+    await expect(manager.getOrCreate('c2c', PEER, PEER, REPLY)).resolves.toBeDefined();
+  });
+
+  it('/new 通过原生创建信号取消未完成的恢复，不必等预处理自行结束', async () => {
+    let signal: AbortSignal | undefined;
+    const { registry } = createRegistry((options) => new Promise((_resolve, reject) => {
+      signal = (options as { signal?: AbortSignal }).signal;
+      signal?.addEventListener('abort', () => reject(signal?.reason), { once: true });
+    }));
+    const manager = createManager(registry);
+    const creating = manager.getOrCreate('c2c', PEER, PEER, REPLY);
+    const rejected = expect(creating).rejects.toThrow(/已停止或重置/);
+    await vi.waitFor(() => expect(signal).toBeDefined());
+    await manager.remove('c2c', PEER);
+    await rejected;
+    expect(signal?.aborted).toBe(true);
+    expect(registry.create).not.toHaveBeenCalled();
+    expect(manager.size).toBe(0);
+  });
+
+  it('宿主释放确切根后清掉旧缓存，下一条输入从保留历史恢复', async () => {
+    const listeners = new Map<string, (event: { agent: DshAgent }) => void>();
+    const ctx = servicesCtx({});
+    vi.mocked(ctx.on as unknown as ReturnType<typeof vi.fn>).mockImplementation((name, listener) => {
+      listeners.set(name, listener);
+      return () => { listeners.delete(name); };
+    });
+    const { registry } = createRegistry(async ({ resumeSessionId }) => fakeHandle(resumeSessionId));
+    const manager = createManagerWithCtx(registry, ctx);
+    const record = await manager.getOrCreate('c2c', PEER, PEER, REPLY);
+    const generation = manager.generation('c2c', PEER);
+    const tasks = { forgetRoot: vi.fn(), hasActive: () => false, closeRoot: vi.fn() };
+    manager.taskRegistry = tasks as unknown as NonNullable<typeof manager.taskRegistry>;
+    listeners.get('agent/disposed')!({ agent: record.agent });
+    expect(manager.getSessionRecord('c2c', PEER)).toBeUndefined();
+    expect(manager.generation('c2c', PEER)).toBe(generation + 1);
+    expect(tasks.forgetRoot).toHaveBeenCalledWith(record.agent);
+    const restored = await manager.getOrCreate('c2c', PEER, PEER, REPLY);
+    expect(restored.sessionId).toBe(record.sessionId);
+    expect(restored.agent).not.toBe(record.agent);
+    // 旧实例晚到的重复事件不得清除新根。
+    listeners.get('agent/disposed')!({ agent: record.agent });
+    expect(manager.getSessionRecord('c2c', PEER)).toBe(restored);
+  });
+
+  it('create 迟到成功时释放旧句柄，reset 后新请求只创建新一代', async () => {
+    const opening = deferred<DshAgentHandle>();
+    const { registry } = createRegistry(async ({ resumeSessionId }) => { throw notFound(resumeSessionId); });
+    registry.create.mockImplementationOnce(() => opening.promise);
+    const manager = createManager(registry);
+    const old = manager.getOrCreate('c2c', PEER, PEER, REPLY);
+    const rejected = expect(old).rejects.toThrow(/已停止或重置/);
+    await vi.waitFor(() => expect(registry.create).toHaveBeenCalledTimes(1));
+    const resetting = manager.remove('c2c', PEER);
+    const fresh = manager.getOrCreate('c2c', PEER, PEER, { ...REPLY, msgId: 'fresh' });
+    const oldHandle = fakeHandle(createdIds(registry)[0]);
+    opening.resolve(oldHandle);
+    await Promise.all([rejected, resetting]);
+    const record = await fresh;
+    expect(oldHandle.dispose).toHaveBeenCalledOnce();
+    expect(record.agent).not.toBe(oldHandle.agent);
+    expect(record.replyTarget.msgId).toBe('fresh');
+    expect(record.sessionId).toBe(persistedId());
+  });
+
+  it('/stop 主回复保留根实例和后台任务，不 drain；失效回调含原因', async () => {
+    const drain = vi.fn(async () => {});
+    const { registry } = createRegistry(async ({ resumeSessionId }) => fakeHandle(resumeSessionId));
+    const manager = createManagerWithCtx(registry, servicesCtx({ subagents: { drainDescendants: drain } }));
+    const record = await manager.getOrCreate('c2c', PEER, PEER, REPLY);
+    const tasks = { hasActive: vi.fn(() => true), closeRoot: vi.fn() };
+    manager.taskRegistry = tasks as unknown as NonNullable<typeof manager.taskRegistry>;
+    const before = manager.generation('c2c', PEER);
+    const listener = vi.fn();
+    manager.onInvalidate(listener);
+    const outcome = await manager.stop('c2c', PEER, 'main');
+    expect(outcome.backgroundActive).toBe(true);
+    expect(manager.getSessionRecord('c2c', PEER)).toBe(record);
+    expect(manager.generation('c2c', PEER)).toBe(before + 1);
+    expect(record.agent.cancel).toHaveBeenCalledWith({ kind: 'user' });
+    expect(drain).not.toHaveBeenCalled();
+    expect(tasks.closeRoot).not.toHaveBeenCalled();
+    expect(listener).toHaveBeenCalledWith(record, KEY, 'main');
+  });
+
+  it('/stop all 按 exact root drain → dispose，下一输入从同历史恢复新根', async () => {
+    const draining = deferred<void>();
+    const order: string[] = [];
+    const drain = vi.fn(async () => { order.push('drain'); await draining.promise; });
+    const { registry } = createRegistry(async ({ resumeSessionId }) => fakeHandle(resumeSessionId));
+    const manager = createManagerWithCtx(registry, servicesCtx({ subagents: { drainDescendants: drain } }));
+    const old = await manager.getOrCreate('c2c', PEER, PEER, REPLY);
+    vi.mocked(old.handle.dispose).mockImplementation(async () => { order.push('dispose'); });
+    const tasks = { hasActive: vi.fn(() => true), closeRoot: vi.fn(() => { order.push('closed'); tasks.hasActive.mockReturnValue(false); }) };
+    manager.taskRegistry = tasks as unknown as NonNullable<typeof manager.taskRegistry>;
+    const stopping = manager.stop('c2c', PEER, 'all');
+    const fresh = manager.getOrCreate('c2c', PEER, PEER, REPLY);
+    await vi.waitFor(() => expect(drain).toHaveBeenCalledWith([old.agent]));
+    expect(registry.resume).toHaveBeenCalledTimes(1);
+    expect(old.handle.dispose).not.toHaveBeenCalled();
+    draining.resolve();
+    await stopping;
+    const record = await fresh;
+    expect(order).toEqual(['drain', 'dispose', 'closed']);
+    expect(record.sessionId).toBe(old.sessionId);
+    expect(record.agent).not.toBe(old.agent);
+    expect(manager.findByAgent(old.agent)).toBeUndefined();
+  });
+
+  it('drain 失败不宣称成功，不复用关闭中的根；显式重试可恢复', async () => {
+    const drain = vi.fn().mockRejectedValueOnce(new Error('drain failed')).mockResolvedValue(undefined);
+    const { registry } = createRegistry(async ({ resumeSessionId }) => fakeHandle(resumeSessionId));
+    const manager = createManagerWithCtx(registry, servicesCtx({ subagents: { drainDescendants: drain } }));
+    const record = await manager.getOrCreate('c2c', PEER, PEER, REPLY);
+    await expect(manager.stop('c2c', PEER, 'all')).rejects.toThrow('drain failed');
+    await expect(manager.getOrCreate('c2c', PEER, PEER, REPLY)).rejects.toThrow('drain failed');
+    expect(record.handle.dispose).not.toHaveBeenCalled();
+    expect(persistedId()).toBe(record.sessionId);
+    await manager.stop('c2c', PEER, 'all');
+    await expect(manager.getOrCreate('c2c', PEER, PEER, REPLY)).resolves.toBeDefined();
+  });
+
+  it('registry 仍返回被释放的同一根时拒绝恢复，不能复用 drain 后的根', async () => {
+    const { registry } = createRegistry(async ({ resumeSessionId }) => fakeHandle(resumeSessionId));
+    const manager = createManager(registry);
+    const record = await manager.getOrCreate('c2c', PEER, PEER, REPLY);
+    await manager.stop('c2c', PEER, 'all');
+    registry.get.mockReturnValue(record.agent as never);
+    await expect(manager.getOrCreate('c2c', PEER, PEER, REPLY)).rejects.toThrow(/尚未释放/);
+  });
+
+  it('借用 live agent 无 disposer 时可停主回复并切换新会话，但不能释放整树', async () => {
+    const drain = vi.fn(async () => {});
+    const { registry } = createRegistry(async ({ resumeSessionId }) => fakeHandle(resumeSessionId));
+    const agent = fakeAgent(LEGACY_ID);
+    registry.get.mockReturnValue(agent as never);
+    const manager = createManagerWithCtx(registry, servicesCtx({ subagents: { drainDescendants: drain } }));
+    const old = await manager.getOrCreate('c2c', PEER, PEER, REPLY);
+    expect(old.ownsAgent).toBe(false);
+    const dispose = vi.spyOn(old.handle, 'dispose');
+    await expect(manager.stop('c2c', PEER, 'all')).rejects.toThrow(/\/new 切换新会话/);
+    await manager.stop('c2c', PEER, 'main');
+    expect(manager.getSessionRecord('c2c', PEER)).toBe(old);
+    await expect(manager.remove('c2c', PEER)).resolves.toEqual({ detached: true, backgroundActive: false });
+    expect(agent.cancel).toHaveBeenCalledTimes(2);
+    expect(drain).not.toHaveBeenCalled();
+    expect(dispose).not.toHaveBeenCalled();
+    expect(manager.deliveryAddress(old.sessionId)).toBeUndefined();
+    expect(manager.findByAgent(agent)).toBeUndefined();
+    const fresh = await manager.getOrCreate('c2c', PEER, PEER, REPLY);
+    expect(fresh.sessionId).not.toBe(old.sessionId);
+    expect(fresh.sessionId).toBe(persistedId());
+    expect(fresh.agent).not.toBe(agent);
+    expect(fresh.ownsAgent).toBe(true);
+  });
+
+  it('借用根重置清理待决交互与旧输入，后台仅移交宿主而不伪称取消', async () => {
+    const { registry } = createRegistry(async ({ resumeSessionId }) => fakeHandle(resumeSessionId));
+    const agent = fakeAgent(LEGACY_ID);
+    registry.get.mockReturnValue(agent as never);
+    const manager = createManager(registry);
+    const old = await manager.getOrCreate('c2c', PEER, PEER, REPLY);
+    const tasks = { hasActive: vi.fn(() => true), forgetRoot: vi.fn(), closeRoot: vi.fn() };
+    manager.taskRegistry = tasks as unknown as NonNullable<typeof manager.taskRegistry>;
+    const questions = { cancelPending: vi.fn() };
+    const approvals = { cancelPending: vi.fn() };
+    manager.questionChannel = questions as unknown as NonNullable<typeof manager.questionChannel>;
+    manager.approvalChannel = approvals as unknown as NonNullable<typeof manager.approvalChannel>;
+    const listener = vi.fn();
+    manager.onInvalidate(listener);
+    const generation = manager.generation('c2c', PEER);
+    const release = manager.holdActivity('c2c', PEER, 'input', generation);
+
+    await expect(manager.remove('c2c', PEER)).resolves.toEqual({ detached: true, backgroundActive: true });
+    expect(listener).toHaveBeenCalledWith(old, KEY, 'reset');
+    expect(questions.cancelPending).toHaveBeenCalledWith(KEY, old);
+    expect(approvals.cancelPending).toHaveBeenCalledWith(KEY);
+    expect(tasks.forgetRoot).toHaveBeenCalledWith(agent);
+    expect(tasks.closeRoot).not.toHaveBeenCalled();
+    await expect(manager.getOrCreate('c2c', PEER, PEER, REPLY, generation)).rejects.toThrow(/已停止或重置/);
+    release();
+    expect(manager.deliveryAddress(old.sessionId)).toBeUndefined();
+  });
+
+  it('借用根取消请求失败时不切换历史，重试重置可恢复', async () => {
+    const { registry } = createRegistry(async ({ resumeSessionId }) => fakeHandle(resumeSessionId));
+    const agent = fakeAgent(LEGACY_ID);
+    registry.get.mockReturnValue(agent as never);
+    const manager = createManager(registry);
+    const old = await manager.getOrCreate('c2c', PEER, PEER, REPLY);
+    vi.mocked(agent.cancel).mockImplementationOnce(() => { throw new Error('cancel failed'); });
+    await expect(manager.remove('c2c', PEER)).rejects.toThrow('cancel failed');
+    expect(persistedId()).toBe(old.sessionId);
+    expect(manager.getSessionRecord('c2c', PEER)).toBe(old);
+    await expect(manager.getOrCreate('c2c', PEER, PEER, REPLY)).rejects.toThrow('cancel failed');
+    await expect(manager.remove('c2c', PEER)).resolves.toEqual({ detached: true, backgroundActive: false });
+    expect(persistedId()).not.toBe(old.sessionId);
+  });
+
+  it('借用根 /new 与 /stop 并发时仍提交新 ID，等待中的输入不复用已解绑的旧根', async () => {
+    const { registry } = createRegistry(async ({ resumeSessionId }) => fakeHandle(resumeSessionId));
+    const agent = fakeAgent(LEGACY_ID);
+    registry.get.mockReturnValue(agent as never);
+    const manager = createManager(registry);
+    const old = await manager.getOrCreate('c2c', PEER, PEER, REPLY);
+    const resetting = manager.remove('c2c', PEER);
+    const stopping = manager.stop('c2c', PEER, 'main');
+    const incoming = manager.getOrCreate('c2c', PEER, PEER, REPLY);
+    const [reset, stop, next] = await Promise.allSettled([resetting, stopping, incoming]);
+    expect(reset).toEqual({ status: 'fulfilled', value: { detached: true, backgroundActive: false } });
+    expect(stop.status).toBe('fulfilled');
+    expect(next.status).toBe('fulfilled');
+    const fresh = await incoming;
+    expect(fresh.agent).not.toBe(old.agent);
+    expect(fresh.sessionId).not.toBe(old.sessionId);
+    expect(fresh.sessionId).toBe(persistedId());
+    expect(fresh.ownsAgent).toBe(true);
+    expect(manager.deliveryAddress(old.sessionId)).toBeUndefined();
+  });
+
+  it('插件卸载等待在途 create 释放，迟到结果不能恢复会话', async () => {
+    const opening = deferred<DshAgentHandle>();
+    const { registry } = createRegistry(() => opening.promise);
+    const manager = createManager(registry);
+    const creating = manager.getOrCreate('c2c', PEER, PEER, REPLY);
+    const rejected = expect(creating).rejects.toThrow(/已停止或重置/);
+    await vi.waitFor(() => expect(registry.resume).toHaveBeenCalled());
+    const disposing = manager.disposeAll();
+    const handle = fakeHandle(LEGACY_ID);
+    opening.resolve(handle);
+    await Promise.all([disposing, rejected]);
+    expect(handle.dispose).toHaveBeenCalledOnce();
+    expect(manager.size).toBe(0);
+    await expect(manager.getOrCreate('c2c', PEER, PEER, REPLY)).rejects.toThrow(/已停止或重置/);
+  });
+
+  it('模型经过验证后原地 select，下步骤生效并保留根；无效选择不改偏好', async () => {
+    const resolveModelInfo = vi.fn(async () => ({ inputModalities: ['text'] }));
+    const { registry } = createRegistry(async ({ resumeSessionId }) => fakeHandle(resumeSessionId));
+    const manager = createManagerWithCtx(registry, servicesCtx({ llm: { resolveModelInfo } }));
+    const record = await manager.getOrCreate('c2c', PEER, PEER, REPLY);
+    const select = vi.fn();
+    Object.assign(record.agent, { model: { current: () => undefined, select } });
+    expect(await manager.setModelOverride('c2c', PEER, { provider: 'p', model: 'next' })).toEqual({ mode: 'next-step' });
+    expect(resolveModelInfo).toHaveBeenCalledWith('p', 'next');
+    expect(select).toHaveBeenCalledWith({ provider: 'p', model: 'next' });
+    expect(manager.getSessionRecord('c2c', PEER)).toBe(record);
+    expect(record.handle.dispose).not.toHaveBeenCalled();
+    resolveModelInfo.mockRejectedValueOnce(new Error('unknown model'));
+    await expect(manager.setModelOverride('c2c', PEER, { provider: 'p', model: 'bad' })).rejects.toThrow('unknown model');
+    expect(manager.getEffectiveModel('c2c', PEER)).toEqual({ provider: 'p', model: 'next' });
+    expect(select).toHaveBeenCalledOnce();
+  });
+
+  it('旧宿主保存下次新会话模型，不替换仍在运行的根', async () => {
+    const { registry } = createRegistry(async ({ resumeSessionId }) => fakeHandle(resumeSessionId));
+    const manager = createManagerWithCtx(registry, servicesCtx({ llm: { resolveModelInfo: async () => ({}) } }));
+    const record = await manager.getOrCreate('c2c', PEER, PEER, REPLY);
+    Object.assign(record.agent, { status: 'running', options: { provider: 'p', model: 'current' } });
+    expect(await manager.setModelOverride('c2c', PEER, { provider: 'p', model: 'next' })).toEqual({ mode: 'next-session' });
+    expect(manager.getEffectiveModel('c2c', PEER)).toEqual({ provider: 'p', model: 'current' });
+    expect(manager.getSessionRecord('c2c', PEER)).toBe(record);
+    expect(record.handle.dispose).not.toHaveBeenCalled();
+    expect(record.agent.cancel).not.toHaveBeenCalled();
+  });
+
+  it('idle 回收同时核验输入、维护、问题、审批、收件箱、出站和后台活动', async () => {
+    const { registry } = createRegistry(async ({ resumeSessionId }) => fakeHandle(resumeSessionId));
+    const manager = createManagerWithCtx(registry, servicesCtx({}), createLogger(), { sessionIdleTimeout: 100 });
+    const record = await manager.getOrCreate('c2c', PEER, PEER, REPLY);
+    const check = () => {
+      record.lastActivity = Date.now() - 1000;
+      (manager as unknown as { evictor: { check(): void } }).evictor.check();
+    };
+    for (const kind of ['input', 'maintenance', 'question', 'approval'] as const) {
+      const release = manager.holdActivity('c2c', PEER, kind);
+      check();
+      expect(manager.size).toBe(1);
+      expect(record.handle.dispose).not.toHaveBeenCalled();
+      release();
+    }
+    Object.assign(record.agent, { inbox: { nextStep: [{}], nextTurn: [] } });
+    check();
+    expect(record.handle.dispose).not.toHaveBeenCalled();
+    Object.assign(record.agent, { inbox: { nextStep: [], nextTurn: [] } });
+    manager.hasTransportActivity = () => true;
+    check();
+    expect(record.handle.dispose).not.toHaveBeenCalled();
+    manager.hasTransportActivity = () => false;
+    const tasks = { hasActive: vi.fn(() => true), closeRoot: vi.fn() };
+    manager.taskRegistry = tasks as unknown as NonNullable<typeof manager.taskRegistry>;
+    check();
+    expect(record.handle.dispose).not.toHaveBeenCalled();
+    tasks.hasActive.mockReturnValue(false);
+    check();
+    await vi.waitFor(() => expect(manager.size).toBe(0));
+    expect(record.handle.dispose).toHaveBeenCalledOnce();
+  });
+
+  it('宿主外部维护期间 status=idle 也不回收，真实空闲后再关闭', async () => {
+    const { registry } = createRegistry(async ({ resumeSessionId }) => fakeHandle(resumeSessionId));
+    const manager = createManagerWithCtx(registry, servicesCtx({}), createLogger(), { sessionIdleTimeout: 100 });
+    const record = await manager.getOrCreate('c2c', PEER, PEER, REPLY);
+    const maintenance = deferred<void>();
+    vi.mocked(record.agent.whenIdle).mockReturnValue(maintenance.promise);
+    const check = () => (manager as unknown as { evictor: { check(): void } }).evictor.check();
+    record.lastActivity = Date.now() - 1000;
+    check();
+    check();
+    await Promise.resolve();
+    expect(record.agent.whenIdle).toHaveBeenCalledOnce();
+    expect(record.agent.cancel).not.toHaveBeenCalled();
+    expect(manager.generation('c2c', PEER)).toBe(0);
+    expect(record.handle.dispose).not.toHaveBeenCalled();
+    maintenance.resolve();
+    await vi.waitFor(() => expect(manager.size).toBe(0));
+    expect(record.handle.dispose).toHaveBeenCalledOnce();
+  });
+
+  it('等待宿主空闲期间收到新输入，旧回收候选不能关闭更新后的会话', async () => {
+    const { registry } = createRegistry(async ({ resumeSessionId }) => fakeHandle(resumeSessionId));
+    const manager = createManagerWithCtx(registry, servicesCtx({}), createLogger(), { sessionIdleTimeout: 100 });
+    const record = await manager.getOrCreate('c2c', PEER, PEER, REPLY);
+    const maintenance = deferred<void>();
+    vi.mocked(record.agent.whenIdle).mockReturnValue(maintenance.promise);
+    record.lastActivity = Date.now() - 1000;
+    (manager as unknown as { evictor: { check(): void } }).evictor.check();
+    await manager.getOrCreate('c2c', PEER, PEER, { ...REPLY, msgId: 'new-message' });
+    maintenance.resolve();
+    await Promise.resolve();
+    expect(record.agent.cancel).not.toHaveBeenCalled();
+    expect(record.handle.dispose).not.toHaveBeenCalled();
+    expect(manager.getSessionRecord('c2c', PEER)).toBe(record);
+  });
+
+  it('群停止/重置不能从最新发送者窃取主体，也不能关闭他人的任务', async () => {
+    const { registry } = createRegistry(async ({ resumeSessionId }) => fakeHandle(resumeSessionId));
+    const manager = createManagerWithCtx(registry, servicesCtx({}), createLogger(), {
+      conversation: { mode: 'interactive', taskAdmins: ['admin'] } as ImQQBotConfig['conversation'],
+    });
+    const record = await manager.getOrCreate('group', 'group1', 'owner', { scope: 'group', targetId: 'group1' });
+    Object.assign(record.agent, { status: 'running' });
+    const tasks = {
+      currentActor: vi.fn(() => 'owner'),
+      list: vi.fn(() => [{ rootSessionId: record.sessionId, ownerId: 'another', settled: false, state: 'running' }]),
+      hasActive: () => false, closeRoot: vi.fn(),
+    };
+    manager.taskRegistry = tasks as unknown as NonNullable<typeof manager.taskRegistry>;
+    await manager.getOrCreate('group', 'group1', 'attacker', { scope: 'group', targetId: 'group1' });
+    expect(record.senderId).toBe('attacker');
+    expect(manager.canControl('group', 'group1', 'attacker', 'main')).toBe(false);
+    expect(manager.canControl('group', 'group1', 'owner', 'main')).toBe(true);
+    expect(manager.canControl('group', 'group1', 'owner', 'all')).toBe(false);
+    expect(manager.canControl('group', 'group1', 'admin', 'all')).toBe(true);
+    tasks.currentActor.mockReturnValue(undefined as unknown as string);
+    expect(manager.canControl('group', 'group1', 'owner', 'main')).toBe(false);
   });
 });

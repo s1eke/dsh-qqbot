@@ -14,6 +14,8 @@ import { presetCommand } from './preset.ts';
 import { statusCommand } from './status.ts';
 import { helpCommand } from './help.ts';
 import { pingCommand, versionCommand, stopCommand, meCommand } from './misc.ts';
+import { tasksCommand, taskCommand } from './tasks.ts';
+import { answerCommand } from './answer.ts';
 
 /**
  * 构建标准命令列表
@@ -26,6 +28,9 @@ export function buildCommandList(deps: CommandDeps): CategorizedCommand[] {
     modelCommand(deps),
     presetCommand(deps),
     stopCommand(deps),
+    tasksCommand(deps),
+    taskCommand(deps),
+    answerCommand(deps),
     // QQBot 特有
     pingCommand(),
     versionCommand(deps),

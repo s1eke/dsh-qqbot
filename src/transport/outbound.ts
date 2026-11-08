@@ -41,6 +41,8 @@ export interface OutboundHandlers {
    * 实时流式帧入口（注册到 ctx.on('agent/assistant-stream', ..., { global: true })）。
    */
   routeStreamFrame(agentId: string, delta: StreamDelta): void;
+  clearSession(sessionId: string): void;
+  hasPending(sessionId: string): boolean;
 }
 
 /** dsh Session 简化类型 */
@@ -62,6 +64,7 @@ const SILENT_TURN_ERROR_CODES = new Set(['STREAM_CLOSED']);
  * 回合归属与投递目标委托给 TurnTracker（与提问/审批/发文件共享）。
  */
 class OutboundRouter {
+  private readonly epochs = new Map<string, number>();
   private readonly buffers = new Map<string, OutboundBuffer>();
   private readonly toolCalls = new Map<string, ToolCallRecord>();
   private readonly streamAttempts = new Map<string, string>();
@@ -155,6 +158,7 @@ class OutboundRouter {
    * attempt 的尾巴混进新内容。
    */
   public routeStreamFrame(agentId: string, delta: StreamDelta): void {
+    if (this.manager.deliveryAddress?.(agentId) === undefined && this.manager.findBySessionId(agentId) === undefined) return;
     if (delta.kind === 'attempt-start') {
       this.streamAttempts.set(agentId, delta.attemptId);
       this.buffers.get(agentId)?.reset();
@@ -178,6 +182,17 @@ class OutboundRouter {
     const plan = this.tracker.planFor(agentId);
     if (plan === undefined) return;
     this.appendChunk(agentId, plan, delta.text);
+  }
+
+  public clearSession(sessionId: string): void {
+    this.epochs.set(sessionId, (this.epochs.get(sessionId) ?? 0) + 1);
+    this.resetTurnState(sessionId);
+    this.tracker.end(sessionId);
+    this.pendingText.delete(sessionId);
+  }
+
+  public hasPending(sessionId: string): boolean {
+    return this.pendingText.has(sessionId) || this.buffers.has(sessionId);
   }
 
   /** 获取或创建会话 buffer 并追加增量。目标在创建时拍下，本回合内不再改。 */
@@ -217,7 +232,7 @@ class OutboundRouter {
   private onMessage(sessionId: string, plan: DeliveryPlan, event: MessageEvent): void {
     const buffer = this.buffers.get(sessionId);
     if (buffer !== undefined && buffer.text.trim()) {
-      this.trackText(sessionId, buffer.flush());
+      this.trackText(sessionId, current => buffer.flush(current));
       this.buffers.delete(sessionId);
       return;
     }
@@ -229,13 +244,29 @@ class OutboundRouter {
     const fullText = textParts.join('\n');
     if (!fullText.trim()) return;
 
-    this.trackText(sessionId, this.send(plan.target, fullText, 'sendMarkdown'));
+    this.trackText(sessionId, current => this.send(plan.target, fullText, 'sendMarkdown', current));
     this.buffers.delete(sessionId);
   }
 
   /** 记录每会话最后一笔在途文本任务（自身吞错：错误已由 send/flush 内部记录） */
-  private trackText(sessionId: string, task: Promise<void>): void {
-    this.pendingText.set(sessionId, task.catch(() => {}));
+  private deliveryGuard(sessionId: string): () => boolean {
+    const record = this.manager.findBySessionId(sessionId);
+    const agent = record?.agent;
+    const epoch = this.epochs.get(sessionId) ?? 0;
+    return () => (this.epochs.get(sessionId) ?? 0) === epoch
+      && (!record || this.manager.findBySessionId(sessionId)?.agent === agent);
+  }
+
+  private trackText(sessionId: string, task: (current: () => boolean) => Promise<void>): void {
+    const current = this.deliveryGuard(sessionId);
+    const before = this.pendingText.get(sessionId) ?? Promise.resolve();
+    const tracked = before.then(() => {
+      if (!current()) return;
+      return task(current);
+    }).catch(() => {}).finally(() => {
+      if (this.pendingText.get(sessionId) === tracked) this.pendingText.delete(sessionId);
+    });
+    this.pendingText.set(sessionId, tracked);
   }
 
   /** 工具调用：仅记录，不发送（避免刷屏，等待结果） */
@@ -260,7 +291,7 @@ class OutboundRouter {
     );
     if (!text) return;
 
-    void this.send(plan.target, text, 'sendToolResult');
+    this.trackText(record.sessionId, current => this.send(plan.target, text, 'sendToolResult', current));
   }
 
   /** 收集本轮声明的交付文件：事件总是先于 turn/end 到达，轮末统一投递 */
@@ -283,12 +314,17 @@ class OutboundRouter {
    * 外层轮次失败不撤销已完成的声明（宿主契约），故失败轮的文件仍投递。
    */
   private finishTurn(sessionId: string, event: TurnEndEvent, plan: DeliveryPlan | undefined): void {
+    const record = this.manager.findBySessionId(sessionId);
+    const agent = record?.agent;
+    const generation = record?.generation;
+    const stillCurrent = () => !record || (this.manager.findBySessionId(sessionId)?.agent === agent
+      && this.manager.findBySessionId(sessionId)?.generation === generation);
     const buffer = this.buffers.get(sessionId);
     // 文本 flush 可等待，保证回复先于交付文件到达用户
-    let flushTask: Promise<void> = Promise.resolve();
+    let flush: (() => Promise<void>) | undefined;
     if (buffer !== undefined) {
       if (buffer.text.trim()) {
-        flushTask = buffer.flush();
+        flush = () => buffer.flush(stillCurrent);
       } else {
         buffer.cancel();
       }
@@ -300,25 +336,36 @@ class OutboundRouter {
     this.presentedCalls.delete(sessionId);
     // assistant/message 已在轮内先行发送的文本可能仍在途：与 turn/end 自身的 flush 一起等待
     const pending = this.pendingText.get(sessionId) ?? Promise.resolve();
-    this.pendingText.delete(sessionId);
 
     const failure = extractTurnError(event.reason);
-    void (async () => {
-      await Promise.all([flushTask, pending]);
+    const finishing = (async () => {
+      await pending;
+      if (!stillCurrent()) return;
+      await flush?.();
+      if (!stillCurrent()) return;
       if (plan !== undefined && failure !== undefined && !SILENT_TURN_ERROR_CODES.has(failure.code)) {
-        await this.send(plan.target, `⚠️ 本轮异常结束\n\`${failure.code}\`: ${failure.message}`, 'sendTurnEndError');
+        await this.send(plan.target, `⚠️ 本轮异常结束\n\`${failure.code}\`: ${failure.message}`, 'sendTurnEndError', stillCurrent);
       }
       if (files.length > 0 && this.deliverer !== undefined && plan !== undefined) {
-        await this.deliverer.deliver(plan.target, files);
+        if (!stillCurrent()) return;
+        if (this.deliverer.deliverWithReceipt) {
+          await this.deliverer.deliverWithReceipt(plan.target, files, () => {
+            if (!stillCurrent()) throw new Error('Conversation closed during file delivery');
+          });
+        } else await this.deliverer.deliver(plan.target, files);
       }
       this.logger.debug(`im-qqbot: turn/end sessionId=${sessionId}`);
-    })();
+    })().catch(err => this.logger.error(`turn delivery failed: ${String(err)}`)).finally(() => {
+      if (this.pendingText.get(sessionId) === finishing) this.pendingText.delete(sessionId);
+    });
+    this.pendingText.set(sessionId, finishing);
   }
 
   /** 统一发送：切分 + 逐 chunk 发送 + 错误记录 */
-  private async send(target: ReplyTarget, text: string, tag: string): Promise<void> {
+  private async send(target: ReplyTarget, text: string, tag: string, shouldSend: () => boolean = () => true): Promise<void> {
     const chunks = chunkMarkdownText(text, this.config.textChunkLimit);
     for (const chunk of chunks) {
+      if (!shouldSend()) return;
       try {
         await this.bot.sendMarkdown(target, chunk);
       } catch (err) {
@@ -369,5 +416,7 @@ export function createOutboundHandler(
   return {
     routeSessionEvent: (session, event) => router.route(session, event),
     routeStreamFrame: (agentId, delta) => router.routeStreamFrame(agentId, delta),
+    clearSession: (sessionId) => router.clearSession(sessionId),
+    hasPending: (sessionId) => router.hasPending(sessionId),
   };
 }

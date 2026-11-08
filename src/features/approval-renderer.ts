@@ -1,7 +1,7 @@
 /**
  * QQ 审批的文本渲染与按钮键盘构建（纯函数，便于单测）。
  *
- * 单次审批：一次只渲染一个审批请求（每个会话同时只有一个 pending 审批）。
+ * 每张卡片只对应一个审批请求；nonce 隔离同会话中的并发请求。
  */
 import type { InlineKeyboard } from '@tencent-connect/qqbot-nodejs';
 import type { ApprovalRequest } from './approval-channel.ts';

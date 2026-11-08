@@ -23,5 +23,8 @@
         sessionIdleTimeout: 1800000
         maxQueue: 20
         processingTimeoutMs: 1800000
+        # 显式改为 interactive 可在执行中继续发送；后台能力取决于实际 preset。
+        conversation:
+          mode: serial
         historyLimit: 10
         debug: false

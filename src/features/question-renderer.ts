@@ -12,11 +12,9 @@ import { BUTTONS_PER_ROW, buttonLabel, encodeButtonData } from './button-utils.t
  *
  * 多行多列布局：每行 BUTTONS_PER_ROW 个按钮，减少选项多时的刷屏。
  *
- * button_data 编码 `{"t":"question","q":<问题id>,"i":<选项下标>}`，由分发器解码。
- * `t` 顶层判别字段供 interaction 统一路由；`q` 关联「当前正在问的题」：逐题
- * 推进时旧题按钮在新题发出后被点击，其 q 不等于当前题 id，可被识别并忽略。
+ * 实际卡片同时编码调用 id、nonce、题目 id 和选项下标，隔离并发调用及旧题按钮。
  */
-export function buildKeyboard(question: UserQuestion): InlineKeyboard | undefined {
+export function buildKeyboard(question: UserQuestion, request?: { callId: string; nonce: string }): InlineKeyboard | undefined {
   const opts = question.options ?? [];
   if (opts.length === 0 || question.multiSelect) return undefined;
 
@@ -36,7 +34,8 @@ export function buildKeyboard(question: UserQuestion): InlineKeyboard | undefine
             type: 1,
             permission: { type: 2 },
             click_limit: 1,
-            data: encodeButtonData({ t: 'question', q: question.id, i: idx }),
+            data: encodeButtonData({ t: 'question', q: question.id, i: idx,
+              ...(request ? { c: request.callId, n: request.nonce } : {}) }),
           },
           // 同一题的选项共享分组：点一个后其余变灰（单选互斥）
           group_id: `q-${question.id}`,
@@ -52,6 +51,7 @@ export function formatQuestion(
   question: UserQuestion,
   requireMentionHint: boolean,
   withButtons: boolean,
+  requestId?: string,
 ): string {
   const lines: string[] = [];
   if (question.header) lines.push(`**${question.header}**`);
@@ -61,6 +61,7 @@ export function formatQuestion(
 
   // 问题行：多选标记前置，用户第一眼就知道作答方式
   lines.push(multi ? `${question.question}（可多选）` : question.question);
+  if (question.detail) lines.push('', question.detail);
 
   // 选项列表：保留完整 label + description（按钮 label 截断时 description 靠正文展示）
   opts.forEach((o, i) => {
@@ -68,7 +69,11 @@ export function formatQuestion(
   });
 
   // 底部引导：用引用块（>）与正文区分；mention 放在「回复」动作后（点按钮无需 @）
-  if (opts.length > 0) {
+  if (requestId) {
+    const mention = requireMentionHint ? '（需 @机器人）' : '';
+    lines.push('', `> ${withButtons ? '点击按钮，或' : ''}使用 /answer ${requestId} <答案>${mention}`);
+    if (multi) lines.push('> 多选可输入多个编号，例如 1,3。');
+  } else if (opts.length > 0) {
     lines.push('');
     const mention = requireMentionHint ? '（需 @机器人）' : '';
     if (withButtons) {

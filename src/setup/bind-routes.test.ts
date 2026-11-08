@@ -331,13 +331,37 @@ describe('bind-routes', () => {
   });
 
   it('GET config：回显生效配置且剔除 appSecret', async () => {
+    const conversation = { mode: 'interactive', admissionTimeoutMs: 45000, taskAdmins: ['owner'] };
     const { routes } = createHarness({
-      currentConfig: () => ({ appId: '102120114', appSecret: 'SECRET', requireMention: true, cwd: '/tmp/w' }),
+      currentConfig: () => ({ appId: '102120114', appSecret: 'SECRET', requireMention: true, cwd: '/tmp/w', conversation }),
     });
     const res = fakeRes();
     await invoke(routes.get(BIND_CONFIG_PATH), fakeReq('GET', { host: '127.0.0.1:3080' }), res);
     expect(res.statusCode).toBe(200);
-    expect(json(res)).toEqual({ config: { appId: '102120114', requireMention: true, cwd: '/tmp/w' } });
+    expect(json(res)).toEqual({ config: { appId: '102120114', requireMention: true, cwd: '/tmp/w', conversation } });
+  });
+
+  it.each(['serial', 'interactive'])('POST config：只接受 conversation.mode=%s，不补默认高级字段', async (mode) => {
+    const update = vi.fn(() => true);
+    const { routes } = createHarness({ onUpdateConfig: update });
+    const res = fakeRes();
+    await invoke(routes.get(BIND_CONFIG_PATH), fakeReq('POST', {}, JSON.stringify({ conversation: { mode } })), res);
+    expect(res.statusCode).toBe(200);
+    expect(update).toHaveBeenCalledExactlyOnceWith({ conversation: { mode } });
+  });
+
+  it.each([
+    null, true, 1, 'interactive', [], {}, { mode: true }, { mode: null }, { mode: 'auto' },
+    { mode: 'interactive', taskAdmins: ['attacker'] }, { mode: 'serial', mainTimeoutMs: 0 },
+    { mode: 'interactive', unknown: true },
+  ])('POST config：拒绝非法 conversation 值 %j 且不触达保存', async (conversation) => {
+    const update = vi.fn(() => true);
+    const { routes } = createHarness({ onUpdateConfig: update });
+    const res = fakeRes();
+    await invoke(routes.get(BIND_CONFIG_PATH), fakeReq('POST', {}, JSON.stringify({ conversation })), res);
+    expect(res.statusCode).toBe(400);
+    expect(json(res)).toMatchObject({ ok: false, error: expect.stringContaining('conversation') });
+    expect(update).not.toHaveBeenCalled();
   });
 
   it('POST config：白名单内合法值通过并触发合并写入', async () => {

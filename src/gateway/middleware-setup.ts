@@ -25,6 +25,8 @@ import type { Logger } from '../types.ts';
 import { buildCommandList } from '../commands/index.ts';
 import { attachmentProcessor } from '../middleware/attachment.ts';
 import { questionAnswer } from '../middleware/question-answer.ts';
+import { interactiveAdmission } from '../middleware/admission.ts';
+import { cacheMsgId } from '../transport/msgid-cache.ts';
 import { getHistoryStore, historyGroupKey } from '../features/history-store.ts';
 
 export function setupMiddlewares(
@@ -81,6 +83,11 @@ export function setupMiddlewares(
 
   // 7. 三层限流（sender / group / global）
   bot.use(rateLimiter());
+  // Control messages also open a fresh QQ reply window for asynchronous results.
+  bot.use(async (ctx, next) => {
+    cacheMsgId(ctx.replyTarget.scope, ctx.replyTarget.targetId, ctx.replyTarget.msgId);
+    await next();
+  });
 
   // 8. 斜杠命令（在 concurrencyGuard 之前，命令匹配后不排队直接响应）
   const slash = slashCommand({
@@ -94,15 +101,16 @@ export function setupMiddlewares(
   // 8.5. 待答问题截获（在 concurrencyGuard 之前，答案消息不排队直接作答）
   bot.use(questionAnswer(manager));
 
-  // 9. 并发串行 + 消息合并（同 peer 排队，避免 session 冲突）
-  bot.use(concurrencyGuard({
-    strategy: 'merge',
-    maxQueue: config.maxQueue,
-    maxProcessingMs: config.processingTimeoutMs,
-  }));
-
-  // 10. C2C 输入状态指示
-  bot.use(typingIndicator());
+  // 9. interactive 只串行接入，不持有代理整轮执行；serial 保留兼容。
+  if (config.conversation?.mode === 'interactive') {
+    bot.use(interactiveAdmission(config, manager));
+  } else {
+    bot.use(concurrencyGuard({
+      strategy: 'merge', maxQueue: config.maxQueue,
+      maxProcessingMs: config.processingTimeoutMs,
+    }));
+    bot.use(typingIndicator());
+  }
 
   // 11. 引用消息解析（记录 + 解析被引用原文）
   bot.use(quoteRef({

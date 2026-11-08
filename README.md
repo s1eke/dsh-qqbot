@@ -105,12 +105,59 @@ npx @deepseek-ai/dsh web --patch /path/to/dsh-qqbot/cordis.dev.yml
 | `textChunkLimit` | number | `4500` | 单条消息最大字符数 |
 | `streaming` | boolean | `true` | 是否启用流式输出（群聊始终不启用） |
 | `sessionIdleTimeout` | number | `1800000` | 会话闲置超时(ms)，默认 30 分钟；`<=0` 表示不回收 |
-| `processingTimeoutMs` | number | `1800000` | 处理超时(ms)，超时中断当前 LLM 调用 |
+| `processingTimeoutMs` | number | `1800000` | serial 的 SDK 处理期限(ms)，不保证取消底层执行 |
 | `maxQueue` | number | `20` | 并发队列最大长度 |
 | `historyLimit` | number | `10` | 群历史缓冲条数 |
 | `askTimeoutMs` | number | `300000` | 待答问题超时(ms)，默认 5 分钟（ask_user_question） |
 | `showToolResults` | boolean | `false` | 是否展示工具调用成功结果（错误始终展示） |
 | `debug` | boolean | `false` | 调试模式 |
+
+### 持续对话与后台任务
+
+在 **QQ 机器人 → 基础设置** 中打开 **执行中接收新消息**，点击 **保存** 即可开启交互模式；关闭则恢复串行处理。开关默认关闭，对应 `conversation.mode: serial`，开启对应 `interactive`。保存沿用现有配置重载流程，会停止当前执行，建议等任务完成后切换；重新发送消息后可用 `/bot-status` 确认实际模式。
+
+该开关只修改对话模式，保留原有超时、输入限额和任务管理员配置。建议使用 Harness `0.2.2-rc.1`；旧宿主缺少 `steer` 时会明确提示，仍可关闭开关切回 `serial`。也可在插件的 `config` 中配置以下字段，无对应环境变量：
+
+```yaml
+conversation:
+  mode: interactive
+  admissionTimeoutMs: 30000
+  maxPendingInputs: 32
+  maxPendingBytes: 262144
+  mainTimeoutMs: 1800000
+  taskTimeoutMs: 3600000
+  taskAdmins: []
+```
+
+普通消息逐条进入主会话，在下一执行步骤读取；不会等整个任务结束，也不再合并成一条消息。`maxQueue` 限制接入中的消息数，`admissionTimeoutMs` 包括排队和附件准备。两项 `maxPending*` 限制宿主尚未领取的消息，字节数按 UTF-8 计算。主回复和后台执行分别计时（`0` 不设运行期限），`processingTimeoutMs` 仅用于 serial。
+
+后台执行复用 Harness 的 managed activation。QQ 使用的实际 preset 需要可见的本地 `subagent` / `subagent_fork` 和 `send_message`、`interrupt_agent`、`list_agents`、`wait_agent` 工具；Web standard preset 已包含这些工具。本地 Spawn/Fork 支持追加要求；外部后端仅执行一次任务，不支持后续消息。主代理负责交流、委派和汇报，子代理遇到问题应报告给主代理，由主代理向用户提问。不要使用已移除的 `run_in_background` 配置。
+
+若希望问题等待到期后仍可继续聊天，在 **QQ 所用 preset 的 `config.plugins` 列表**中配置这一行（不是顶层 patch 操作）：
+
+```yaml
+- id: tool-ask-user
+  name: '@deepseek-ai/dsh-tool-ask-user'
+  config:
+    mode: timed
+    timeout: 30  # 秒；-1 一直等待。工具审批始终阻塞，超时不代表批准。
+```
+
+| 操作 | 行为 |
+| --- | --- |
+| 普通聊天、补充要求 | 下一步骤接收；目标不明确时由主代理澄清 |
+| `/tasks`、`/task <编号>` | 查询执行状态和已保存结果；重试查看结果不重跑任务 |
+| `/answer`、`/answer <请求编号> <答案>` | 查看待答问题或明确作答；也可点击按钮、引用问题卡片回答 |
+| `/stop` | 请求停止主回复，后台任务继续 |
+| `/stop <任务编号>` | 停止该任务的当前执行；反馈实际停止状态 |
+| `/stop all` | 收束整棵任务树并释放根实例，保留历史；下次消息恢复新实例 |
+| `/new` / `/reset` / `/clear` | 开始新会话并清理 QQ 待决交互；插件自有旧树关闭，借用宿主的旧会话解除 QQ 关联 |
+| `/model provider/model` | 新版宿主下一步骤原地切换；当前步骤及后台任务保持原选择 |
+| `/bot-status` | 查看模式、steering、后台工具和模型切换能力 |
+
+普通未引用的聊天不会被当作答案。群聊任务控制和交互按钮只允许任务发起者或 `conversation.taskAdmins` 中的 QQ OpenID；多个发送者在同一步混合时会要求单独确认目标，避免借用其他人的权限。旧宿主没有模型原地选择接口时，只保存新会话偏好。宿主已持有的借用会话无法由插件释放，`/stop all` 会说明原因；仍可用 `/stop` 请求停止主回复，或用 `/new` 切换新会话。后者请求停止旧主回复、清理 QQ 关联与待决交互，保留宿主中的旧会话及历史；旧后台任务尚未确认结束时会明确提示，并标记为“状态待核实”，需在宿主中查看或停止。
+
+后台任务依赖宿主进程存活。任务记录存于 `~/.dsh-qqbot/tasks/`，问答卡片关联存于 `~/.dsh-qqbot/question-cards/`；重启后未确认结束的任务显示“状态待核实”，不会自动重跑。主会话使用 `qqbot_report_task` 发送保存结果和声明文件，按真实回执记录送达；失败可重试投递，不重跑任务。QQ 回复窗口或主动发送失败时仍可查询结果；“执行结束”与“结果送达”分开记录。网络超时或分块部分成功后的重试可能重复已收到的片段。切回 serial 前先执行 `/stop all`，避免遗留后台工作。完整设计与验收项见 [方案文档](plans/conversational-background-tasks.md)。
 
 ### 访问控制（access）
 

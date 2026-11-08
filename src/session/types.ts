@@ -25,12 +25,21 @@ export interface DshAgent {
   readonly ctx: Context;
   /** 当前生命周期状态（用于判断是否正在生成） */
   readonly status: 'idle' | 'running';
+  /** 旧宿主当前实例的模型路由回退，区别于已保存的新会话偏好。 */
+  readonly options?: { provider?: string; model?: string };
   /** 底层 session（fork 时作为 source；snapshotEvents 用于统计/导出） */
   readonly session: {
     readonly id: string;
     snapshotEvents(): readonly SessionEventLike[];
   };
-  cancel(cause: { kind: string }): void;
+  /** 新宿主的持久模型选择；旧版缺失时走兼容路径。 */
+  readonly model?: {
+    current(): { provider: string; model: string; reasoningEffort?: string } | undefined;
+    select(selection: { provider: string; model: string; reasoningEffort?: string }): void;
+  };
+  readonly inbox?: { readonly nextTurn: readonly unknown[]; readonly nextStep: readonly unknown[] };
+  cancel(cause: { kind: string }, options?: { keepInbox?: boolean }): void;
+  steer?(message: unknown): void;
   followup(message: unknown): void;
   whenIdle(): Promise<void>;
   /** 运行一个非 turn 维护任务（compact 等需要 idle 时串行执行的操作） */
@@ -80,12 +89,15 @@ export interface DshAgentRegistry {
   /** 从持久化存储恢复 session */
   resume(options: {
     resumeSessionId: string;
+    /** 只约束创建/恢复过程；宿主在返回句柄前脱离此信号。 */
+    signal?: AbortSignal;
     agentOptions?: { provider?: string; model?: string };
     setup?: AgentSetup;
   }): Promise<DshAgentHandle>;
   /** 创建全新 session */
   create(options: {
     sessionId: string;
+    signal?: AbortSignal;
     meta?: { cwd?: string; isSeeded?: boolean; parentSession?: string; agentPreset?: string };
     seed?: readonly unknown[];
     /** 继承前缀长度（seeded fork 用，对齐宿官方 commands.fork） */
@@ -119,16 +131,37 @@ export interface PresetComposition {
 
 /** 单个会话记录 */
 export interface SessionRecord {
+  /** 入站代次；主回合停止也会更新，后台任务身份使用确切 agent 实例。 */
+  generation?: number;
   sessionKey: string;
   sessionId: string;
   agent: DshAgent;
   handle: DshAgentHandle;
+  /** get() 复用的裸 agent 没有关闭能力；重置仅解绑，不能 drain 后假装释放成功。 */
+  ownsAgent?: boolean;
   replyTarget: ReplyTarget;
   scope: ChatScope;
   peerId: string;
   senderId: string;
   lastActivity: number;
   agentPreset?: string;
+}
+
+export interface ResetOutcome {
+  /** 旧根由宿主持有，仅解除 QQ 关联，未释放宿主实例。 */
+  detached: boolean;
+  /** 解绑前仍有未确认结束的后台任务，不能声称已取消。 */
+  backgroundActive: boolean;
+}
+
+export interface StopOutcome {
+  stopped: boolean;
+  backgroundActive: boolean;
+  mode: 'main' | 'all';
+}
+
+export interface ModelSwitchOutcome {
+  mode: 'next-step' | 'next-session';
 }
 
 /** 会话状态信息（/status 用） */

@@ -14,15 +14,18 @@ export class IdleEvictor {
   private readonly sessions: Map<string, SessionRecord>;
   private readonly timeoutMs: number;
   private readonly onEvict: (key: string, record: SessionRecord) => void;
+  private readonly isBusy: (key: string, record: SessionRecord) => boolean;
 
   constructor(
     sessions: Map<string, SessionRecord>,
     timeoutMs: number,
     onEvict: (key: string, record: SessionRecord) => void,
+    isBusy: (key: string, record: SessionRecord) => boolean = (_key, record) => record.agent.status !== 'idle',
   ) {
     this.sessions = sessions;
     this.timeoutMs = timeoutMs;
     this.onEvict = onEvict;
+    this.isBusy = isBusy;
     if (timeoutMs > 0) {
       this.timer = setInterval(() => this.check(), CHECK_INTERVAL_MS);
     }
@@ -33,6 +36,10 @@ export class IdleEvictor {
     if (this.timeoutMs <= 0) return;
     const now = Date.now();
     for (const [key, record] of this.sessions) {
+      if (this.isBusy(key, record)) {
+        record.lastActivity = now;
+        continue;
+      }
       if (now - record.lastActivity > this.timeoutMs) {
         this.onEvict(key, record);
       }

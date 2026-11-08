@@ -66,6 +66,37 @@ function setup(opts?: {
 const delta = (attemptId: string, text: string) => ({ kind: 'text-delta' as const, attemptId, text });
 const start = (attemptId: string) => ({ kind: 'attempt-start' as const, attemptId });
 
+describe('asynchronous delivery ownership', () => {
+  it('keeps the root active until ordered text and the final file are delivered', async () => {
+    const file = Promise.withResolvers<void>();
+    const first = Promise.withResolvers<void>();
+    const deliver = vi.fn(() => file.promise);
+    const {outbound,bot} = setup({config:createConfig({streaming:false}),deliverer:{deliver}});
+    vi.mocked(bot.sendMarkdown).mockImplementationOnce(()=>first.promise);
+    const session = {header:{id:'sess-qq'}};
+    const send=(text:string)=>outbound.routeSessionEvent(session,{type:'assistant/message',data:{message:{content:[{type:'text',text}]}}});
+    send('first'); send('second');
+    outbound.routeSessionEvent(session,{type:'deliverables/presented',data:{turn:1,callId:'p',files:[{path:'/tmp/a'}]}});
+    outbound.routeSessionEvent(session,{type:'turn/end',data:{reason:{kind:'completed'}}});
+    await Promise.resolve(); expect(bot.sendMarkdown).toHaveBeenCalledTimes(1);
+    expect(outbound.hasPending('sess-qq')).toBe(true);
+    first.resolve(); await vi.waitFor(()=>expect(deliver).toHaveBeenCalledOnce());
+    expect(vi.mocked(bot.sendMarkdown).mock.calls.map(call=>call[1])).toEqual(['first','second']);
+    expect(outbound.hasPending('sess-qq')).toBe(true);
+    file.resolve(); await vi.waitFor(()=>expect(outbound.hasPending('sess-qq')).toBe(false));
+  });
+  it('a reset discards queued old output even while the closing record is still present', async () => {
+    const first = Promise.withResolvers<void>();
+    const {outbound,bot} = setup({config:createConfig({streaming:false,textChunkLimit:4})});
+    vi.mocked(bot.sendMarkdown).mockImplementationOnce(()=>first.promise);
+    const session={header:{id:'sess-qq'}};
+    for(const text of ['already sending','must not send']) outbound.routeSessionEvent(session,{type:'assistant/message',data:{message:{content:[{type:'text',text}]}}});
+    await Promise.resolve(); outbound.clearSession('sess-qq'); first.resolve();
+    for(let i=0;i<15;i++) await Promise.resolve();
+    expect(bot.sendMarkdown).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe('OutboundRouter.routeStreamFrame', () => {
   beforeEach(() => {
     vi.useFakeTimers();
